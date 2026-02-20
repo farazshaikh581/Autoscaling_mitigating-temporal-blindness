@@ -1,0 +1,16 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: scale-agent
+  namespace: factorizator
+  labels:
+    app: factorizator
+spec:
+  type: ClusterIP
+  selector:
+    app: factorizator
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8080
+      targetPort: 80
