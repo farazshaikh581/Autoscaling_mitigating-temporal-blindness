@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: factorizator
+  namespace: factorizator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: factorizator
+  template:
+    metadata:
+      labels:
+        app: factorizator
+    spec:
+      containers:
+      - name: factorizator
+        image: your_docker_image here
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "256Mi"
+        # Add a simple load endpoint simulation
+        command: ["/bin/sh"]
+        args: ["-c", "echo 'server { listen 80; location / { return 200 \"OK\"; } location /health { return 200 \"healthy\"; } }' > /etc/nginx/conf.d/default.conf && nginx -g 'daemon off;'"]
