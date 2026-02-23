@@ -1,5 +1,3 @@
-# -*- coding: utf-8 -*-
-# -*- coding: utf-8 -*-
 # === PROPOSED APPROACH: Attention + Double LSTM ===
 # Comparison: Matches Baseline capacity (256 units) but adds Attention & Depth
 # Architecture: Windowed Input -> Double LSTM -> Attention -> PPO
@@ -263,7 +261,7 @@ class MultiAgentClusterEnv(gym.Env):
         # FIX: TRUE IDLE MODE (Prevents Timeout Crash)
         # ============================================
         # Only truly idle if no requests at all
-        if raw_requests < 0.01:
+        if raw_requests < 1.0:
             logging.info(f"Step {self.steps}: Trace=0 | Idle (No requests)")
             time.sleep(60)  # Add sleep to match StaticHPA timing
             self._latency_p90 = 0.005
@@ -287,7 +285,11 @@ class MultiAgentClusterEnv(gym.Env):
         # 2. Calculate Pacing
         # Trace = Requests per Minute.
         # Target QPS = Requests / 60 seconds.
-        target_qps = raw_requests / 60.0
+        #target_qps = raw_requests / 60.0
+
+
+
+        target_qps = (raw_requests * self.throughput_multiplier) / 60.0
         
         # 3. Workload (Raw 'n')
         #work_param = 1000000007000000009  # Hard semiprime
@@ -319,8 +321,8 @@ class MultiAgentClusterEnv(gym.Env):
         
         except Exception as e:
             logging.error(f"Hey execution exception: {e}")
-            self._latency_p90 = 0.05
-            self._latency_avg = 0.05
+            self._latency_p90 = 1
+            self._latency_avg = 1
             self._success_ratio = 0.0
 
         return raw_requests, self._latency_p90, self._success_ratio
