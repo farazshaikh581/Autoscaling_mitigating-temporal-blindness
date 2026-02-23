@@ -111,6 +111,7 @@ class DQNClusterEnv(gym.Env):
         
         self.reward = 0.0
         self._latency_p90 = 0.05; self._latency_avg = 0.05; self._success_ratio = 1.0
+        self.last_replicas = 1
         
         # === OBSERVATION SPACE: 13 DIMS (Matches Saved Model) ===
         # Removed the 14th dimension (Forecast)
@@ -187,7 +188,7 @@ class DQNClusterEnv(gym.Env):
             self._parse_hey_output(full_output, raw_requests)
         except Exception as e:
             logging.error(f"Hey execution exception: {e}")
-            self._latency_p90 = 0.05; self._latency_avg = 0.05; self._success_ratio = 0.0
+            self._latency_p90 = 1; self._latency_avg = 1; self._success_ratio = 0.0
 
         return raw_requests, self._latency_p90, self._success_ratio
 
@@ -226,6 +227,7 @@ class DQNClusterEnv(gym.Env):
         return np.array([lat, reps, cpu, ram, eff_req, t_cpu, t_ram, succ, 
                         self.hpa_target, self.throughput_multiplier, self.enhancement, 
                         math.cos(angle), math.sin(angle)], dtype=np.float32)
+ 
 
     def compute_reward(self):
         lat = self._latency_p90
@@ -233,16 +235,22 @@ class DQNClusterEnv(gym.Env):
         replicas = self.state[1]
         succ = self._success_ratio
         
+        # 1. SLO Reward
         if lat <= 0.020: r_sla = 1.0
         elif lat <= 0.050: r_sla = 0.5 + 0.5 * (0.050 - lat) / 0.030
         else: r_sla = max(-1.0, -0.5 * (lat - 0.050) / 0.1)
         
+        # 2. CPU Reward
         r_cpu = 1.0 if abs(cpu - 50) <= 10 else np.exp(-((cpu - 50)/50)**2)
-        r_cost = -0.05 * replicas
-        r_fail = -5.0 if succ < 0.95 else 0.0
         
-        reward = 0.5*r_sla + 0.25*r_cpu + 0.15*succ + r_cost + r_fail
+        # 3. Stability Penalty
+        delta = abs(replicas - getattr(self, 'last_replicas', replicas))
+        r_stab = 0.5 if delta == 0 else (0.3 if delta <=2 else -0.2 * min(1.0, delta/10))
+        
+        # Final Composite Reward
+        reward = 0.5*r_sla + 0.25*r_cpu + 0.15*succ + 0.1*r_stab
         self.reward = reward
+        self.last_replicas = replicas
         return reward
 
     def step(self, action):
@@ -278,6 +286,7 @@ class DQNClusterEnv(gym.Env):
         subprocess.run(f"kubectl scale deployment {application} --replicas=1 -n {app_env}", shell=True, stdout=subprocess.DEVNULL)
         time.sleep(5)
         self.current_replicas = 1
+        self.last_replicas = 1
         
         self.state = np.array([0.05, 1, 30, 40, 100, 1500, 2000, 1, 50, 1.0, 0, 1, 0], dtype=np.float32)
         return self.state, {}
