@@ -1,7 +1,4 @@
-# -*- coding: utf-8 -*-
-# === STRICT BASELINE PAPER IMPLEMENTATION ===
-# Reference: Agarwal et al. [2308.05937v2]
-# Changes: 
+# Changes from Double-LSTM: 
 #  1. Single LSTM Layer (256 units)
 #  2. No Explicit Forecast Input (The LSTM must learn the trend)
 #  3. No History Stacking (The LSTM state handles memory)
@@ -195,7 +192,9 @@ class MultiAgentClusterEnv(gym.Env):
         #concurrency = max(1, min(ideal_workers, 20))
         concurrency = max(1, min(int(raw_requests / 10), 10))
         #safe_requests = max(1.0, raw_requests)
-        target_qps = raw_requests / 60.0
+        #target_qps = raw_requests / 60.0
+
+        target_qps = (raw_requests * self.throughput_multiplier) / 60.0
         q_per_worker = target_qps / concurrency
         
         work_param = 1000000016000000063
@@ -209,7 +208,7 @@ class MultiAgentClusterEnv(gym.Env):
             self._parse_hey_output(output.stdout + "\n" + output.stderr, raw_requests)
         except Exception as e:
             logging.error(f"Hey error: {e}")
-            self._latency_p90 = 0.05; self._latency_avg = 0.05; self._success_ratio = 0.0
+            self._latency_p90 = 1; self._latency_avg = 1; self._success_ratio = 0.0
 
         return raw_requests, self._latency_p90, self._success_ratio
 
