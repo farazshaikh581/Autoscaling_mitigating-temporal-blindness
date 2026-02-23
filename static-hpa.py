@@ -146,12 +146,13 @@ class StaticBenchmark:
         
         logging.info(f"Step {self.steps}: Trace={raw_requests:.0f} | Workers={concurrency} | QPS={target_qps:.2f}")
 
-        lat_p90, lat_avg, success = 0.05, 0.05, 0.0
+        lat_p90, lat_avg, success = 1, 1, 0.0
         try:
             output = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=80)
             lat_p90, lat_avg, success = self._parse_hey(output.stdout + "\n" + output.stderr)
         except Exception as e:
             logging.error(f"Hey error: {e}")
+            self._latency_p90 = 1.0; self._latency_avg = 1.0; self._success_ratio = 0.0
 
         return raw_requests, lat_p90, lat_avg, success
 
