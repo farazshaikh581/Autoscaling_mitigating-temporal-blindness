@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 application = "factorizator"
 app_env = "factorizator"
 MINUTES_PER_DAY = 500 
-SEED = 42
+SEED = SEED
 
 # Global Seeding
 np.random.seed(SEED)
