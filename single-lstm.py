@@ -62,6 +62,8 @@ MAX_REPLICAS = 200
 NR_REQUESTS_MAX = 3000
 MINUTES_PER_DAY = 500 
 
+
+
 # ============================================
 # === UTILS ===
 # ============================================
@@ -245,23 +247,56 @@ class MultiAgentClusterEnv(gym.Env):
         # --- RETURN 13 DIMS (No Forecast) ---
         return np.array([lat, reps, cpu, ram, eff_req, t_cpu, t_ram, succ, self.hpa_target, self.throughput_multiplier, self.enhancement, math.cos(angle), math.sin(angle)], dtype=np.float32)
 
-    def compute_reward(self):
-        lat = self._latency_p90
-        cpu = self.state[2]
-        replicas = self.state[1]
-        succ = self._success_ratio
-        
-        if lat <= 0.020: r_sla = 1.0
-        elif lat <= 0.050: r_sla = 0.5 + 0.5 * (0.050 - lat) / 0.030
-        else: r_sla = max(-1.0, -0.5 * (lat - 0.050) / 0.1)
-        
-        r_cpu = 1.0 if abs(cpu - self.hpa_target) <= 10 else np.exp(-((cpu - self.hpa_target)/50)**2)
-        delta = abs(replicas - self.last_replicas)
-        r_stab = 0.5 if delta == 0 else (0.3 if delta <=2 else -0.2 * min(1.0, delta/10))
-        
-        reward = 0.5*r_sla + 0.25*r_cpu + 0.15*succ + 0.1*r_stab
-        self.current_step_reward = reward; self.reward = reward; self.last_replicas = replicas
-        return reward
+    def computereward(self):
+        lat = float(self.latencyp90)      # P90 latency in seconds
+        cpu = float(self.state[2])        # cpu utilization %
+        replicas = float(self.state[1])   # replica count
+        succ = float(self.successratio)   # success ratio in [0,1]
+    
+        # --- Thresholds
+        L_TARGET = 0.020
+        L_THRESH = 0.050
+    
+        if lat <= L_TARGET:
+            r_sla = 1.0
+        elif lat <= L_THRESH:
+            r_sla = 0.5 + 0.5 * (L_THRESH - lat) / (L_THRESH - L_TARGET)
+        else:
+            r_sla = max(-1.0, -0.5 * (lat - L_THRESH) / 0.1)
+    
+        if abs(cpu - float(self.hpatarget)) <= 10.0:
+            r_cpu = 1.0
+        else:
+            r_cpu = float(np.exp(-((cpu - float(self.hpatarget)) / 50.0) ** 2))
+    
+        delta = abs(float(replicas) - float(self.lastreplicas))
+        if delta <= 2.0:
+            r_stab = -0.1 * delta
+        else:
+            r_stab = -0.5 * delta
+    
+        if succ >= 0.99:
+            r_succ = 1.0
+        else:
+            r_succ = float(np.log(max(succ, 1e-6)))
+    
+        # drop wfcst and renormalize by (1 - 0.05) = 0.95
+        W_SLA  = 0.50 / 0.95
+        W_CPU  = 0.25 / 0.95
+        W_STAB = 0.08 / 0.95
+        W_SUCC = 0.12 / 0.95
+    
+        reward = (
+            W_SLA  * r_sla +
+            W_CPU  * r_cpu +
+            W_STAB * r_stab +
+            W_SUCC * r_succ
+        )
+    
+        self.currentstepreward = float(reward)
+        self.reward = float(reward)
+        self.lastreplicas = float(replicas)
+        return float(reward)
 
     def apply_multiagent_action(self, action):
         opts = [30, 50, 70, 90]
@@ -385,6 +420,7 @@ class TensorboardCallback(BaseCallback):
                 f.flush(); os.fsync(f.fileno())
         return True
 
+lr_schedule = lambda p: cosine_schedule(p, lr_start=2e-4, lr_end=0.0)
 
 # ============================================
 # === MAIN ===
@@ -425,35 +461,6 @@ if __name__ == "__main__":
     vec_train = VecNormalize(DummyVecEnv([lambda: build_env(tr_days)]), norm_obs=True, norm_reward=False, clip_obs=10.)
     
     if args.mode == "train":
-            logging.info("Starting Baseline LSTM Training...")
-            logging.info(f"📊 Logging to: {train_csv}")
-            
-            model = RecurrentPPO(
-                "MlpLstmPolicy", 
-                vec_train,
-                n_steps=128, batch_size=128,
-                gamma=0.99, gae_lambda=0.95,
-                learning_rate=3e-4, 
-                policy_kwargs={
-                    'n_lstm_layers': 1,          # Single Layer
-                    'lstm_hidden_size': 256,     # 256 Units
-                    'net_arch': dict(pi=[64, 64], vf=[64, 64]) # 2x64 MLP
-                }, 
-                verbose=1, tensorboard_log=f"{log_dir}/tb", n_epochs=10, device='cuda'
-            )
-            
-            cbs = [
-                DetailedLoggingCallback(), 
-                TensorboardCallback(train_csv), 
-                CheckpointCallback(500, f"{log_dir}/ckpt_baseline")
-            ]
-            model.learn(total_timesteps=len(tr_days)*MINUTES_PER_DAY, callback=cbs)
-            
-            model.save(f"{log_dir}/final_model_baseline")
-            vec_train.save(f"{log_dir}/vecnorm_baseline.pkl")
-            logging.info("Done Training!")
-    
-    if args.mode == "train":
         logging.info("Starting Baseline LSTM Training...")
         logging.info(f"📊 Logging to: {train_csv}")
         
@@ -462,7 +469,7 @@ if __name__ == "__main__":
             vec_train,
             n_steps=128, batch_size=128,
             gamma=0.99, gae_lambda=0.95,
-            learning_rate=3e-4, 
+            learning_rate=lr_schedule, 
             policy_kwargs={
                 'n_lstm_layers': 1,          # Single Layer
                 'lstm_hidden_size': 256,     # 256 Units
