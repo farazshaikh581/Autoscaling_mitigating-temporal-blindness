@@ -28,6 +28,8 @@ app_env = "factorizator"
 MINUTES_PER_DAY = 500 
 SEED = SEED
 
+# Although several seed values were explored during our experiments, all reported results in the paper correspond to runs with the random seed fixed at 42.
+
 # Global Seeding
 np.random.seed(SEED)
 random.seed(SEED)
