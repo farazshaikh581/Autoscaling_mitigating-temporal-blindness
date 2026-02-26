@@ -242,9 +242,10 @@ class MultiAgentClusterEnv(gym.Env):
         if self.steps + self.days * self.max_minutes >= len(self.day_list) * self.max_minutes:
             self.days += 1
             self.steps = 0
-
-        current_day_idx = (self.steps // self.max_minutes) % len(self.day_list)
-        current_min_idx = self.steps % self.max_minutes
+        
+        current_day_idx = (self.steps + self.days * self.max_minutes) // self.max_minutes
+        current_day_idx = min(current_day_idx, len(self.day_list) - 1)
+        current_min_idx = (self.steps + self.days * self.max_minutes) % self.max_minutes
 
         # 2. Get Raw Demand (Requests per Minute)
         #try:
@@ -366,39 +367,45 @@ class MultiAgentClusterEnv(gym.Env):
         return np.array([lat, reps, cpu, ram, eff_req, t_cpu, t_ram, succ, self.hpa_target, self.throughput_multiplier, self.enhancement, math.cos(angle), math.sin(angle), self.forecast_running_avg], dtype=np.float32)
 
     def compute_reward(self):
-        # Current metrics
+        lat = float(self._latency_p90)
+        cpu = float(self.state[2])
+        replicas = int(self.state[1])
+        succ = float(self._success_ratio)
     
+        # RSLO
         if lat <= L_TARGET:
             r_sla = 1.0
         elif lat <= L_THRESH:
-            # Linear decay from 1.0 -> 0.5 between 20ms and 50ms (same as your current style)
             r_sla = 0.5 + 0.5 * (L_THRESH - lat) / (L_THRESH - L_TARGET)
         else:
-            # Hard penalty beyond 50ms (same as your current style)
             r_sla = max(-1.0, -0.5 * (lat - L_THRESH) / 0.1)
     
-        if abs(cpu - float(self.hpa_target)) <= 10.0:
+        # RCPU (centered at current HPA target)
+        thpa = float(self.hpa_target)
+        if abs(cpu - thpa) <= 10.0:
             r_cpu = 1.0
         else:
-            r_cpu = float(np.exp(-((cpu - float(self.hpatarget)) / 50.0) ** 2))
+            r_cpu = float(np.exp(-((cpu - thpa) / 50.0) ** 2))
     
-        delta = abs(float(replicas) - float(self.lastreplicas))
-        if delta <= 2.0:
+        # RStab
+        delta = abs(replicas - int(self.last_replicas))
+        if delta <= 2:
             r_stab = -0.1 * delta
         else:
             r_stab = -0.5 * delta
     
-        effreq = float(self.state[4])   
-        Nt = float(self.forecast_running_avg)
-        
-        C = float(NOMINAL_CAP_PER_REPLICA)
-        err = (effreq - Nt) / max(C, 1e-6)
-        r_fcst = -(err ** 2)
-    
+        # RSucc
         if succ >= 0.99:
             r_succ = 1.0
         else:
             r_succ = float(np.log(max(succ, 1e-6)))
+    
+
+        effreq = float(self.state[4])
+        Nt = float(self.forecast_running_avg)
+        C = float(NOMINAL_CAP_PER_REPLICA)
+        err = (effreq - Nt) / max(C, 1e-6)
+        r_fcst = -(err ** 2)
     
         reward = (
             W_SLA  * r_sla +
@@ -408,9 +415,9 @@ class MultiAgentClusterEnv(gym.Env):
             W_SUCC * r_succ
         )
     
-        self.currentstepreward = float(reward)
+        self.current_step_reward = float(reward)
         self.reward = float(reward)
-        self.lastreplicas = float(replicas)
+        self.last_replicas = replicas
         return float(reward)
 
     
@@ -449,7 +456,7 @@ class MultiAgentClusterEnv(gym.Env):
         # Update Window History
         self.state_history.append(self.state)
         self.steps += 1; self.global_step += 1
-        term = self.steps >= self.days_train * self.max_minutes
+        term = self.global_step >= (self.days_train * self.max_minutes)
         
         # Return Flattened Window
         flattened_obs = np.array(self.state_history, dtype=np.float32).flatten()
