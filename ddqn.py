@@ -96,7 +96,7 @@ class DQNClusterEnv(gym.Env):
         self.df = pd.read_csv(invocation_file)
         self.df = add_day_column(self.df)
         
-        self.action_space = gym.spaces.Discrete(3)
+        self.action_space = gym.spaces.Discrete(4 * 3 * 3 * 3)
         
         self.day_list = day_list
         self.max_minutes = MINUTES_PER_DAY 
@@ -121,6 +121,17 @@ class DQNClusterEnv(gym.Env):
         self.observation_space = gym.spaces.Box(low=self.low_base, high=self.high_base, dtype=np.float32)
         
         self.state = np.array([0.05, 1, 30, 40, 100, 1500, 2000, 1, 50, 1.0, 0, 1, 0], dtype=np.float32)
+
+
+    def decode_action(self, a: int) -> np.ndarray:
+        a = int(a)
+        a0 = a // 27
+        rem = a % 27
+        a1 = rem // 9
+        rem = rem % 9
+        a2 = rem // 3
+        a3 = rem % 3
+        return np.array([a0, a1, a2, a3], dtype=np.int64)
 
     def make_invocation_matrix(self):
         matrix = np.zeros((len(self.day_list), self.max_minutes))
@@ -150,14 +161,49 @@ class DQNClusterEnv(gym.Env):
         except:
             return 1, 1, 1, 1
 
+    def apply_multiagent_action(self, action_vec: np.ndarray):
+        # action_vec: [hpa_target_idx, lr_idx(dummy), throughput_idx, enhancement_idx]
+        opts = [30, 50, 70, 90]
+        new_t = int(opts[int(action_vec[0]) % 4])
+
+        if new_t != self.hpa_target:
+            self.hpa_target = new_t
+            patch = {
+                "spec": {
+                    "metrics": [{
+                        "type": "Resource",
+                        "resource": {
+                            "name": "cpu",
+                            "target": {
+                                "type": "Utilization",
+                                "averageUtilization": new_t
+                            }
+                        }
+                    }]
+                }
+            }
+            try:
+                subprocess.run(
+                    ["kubectl", "patch", "hpa", application, "-n", app_env, "--patch", json.dumps(patch)],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True
+                )
+            except Exception:
+                pass
+
+        self.throughput_multiplier = [1.0, 2.0, 3.0][int(action_vec[2]) % 3]
+        self.enhancement = int(action_vec[3]) % 3
+
+    
     def run_hey(self):
-        # 1. Day/Step Cycling
-        if self.steps + self.days * self.max_minutes >= len(self.day_list) * self.max_minutes:
+        if self.steps >= self.max_minutes:
             self.days += 1
             self.steps = 0
-
-        current_day_idx = (self.steps // self.max_minutes) % len(self.day_list)
-        current_min_idx = self.steps % self.max_minutes
+        
+        current_day_idx = min(self.days, len(self.day_list)-1)
+        current_min_idx = self.steps
 
         # 2. Get Raw Demand
         # Robust check to prevent index errors
@@ -230,64 +276,108 @@ class DQNClusterEnv(gym.Env):
  
 
     def compute_reward(self):
-        lat = self._latency_p90
-        cpu = self.state[2]
-        replicas = self.state[1]
-        succ = self._success_ratio
-        
-        # 1. SLO Reward
-        if lat <= 0.020: r_sla = 1.0
-        elif lat <= 0.050: r_sla = 0.5 + 0.5 * (0.050 - lat) / 0.030
-        else: r_sla = max(-1.0, -0.5 * (lat - 0.050) / 0.1)
-        
-        # 2. CPU Reward
-        r_cpu = 1.0 if abs(cpu - 50) <= 10 else np.exp(-((cpu - 50)/50)**2)
-        
-        # 3. Stability Penalty
-        delta = abs(replicas - getattr(self, 'last_replicas', replicas))
-        r_stab = 0.5 if delta == 0 else (0.3 if delta <=2 else -0.2 * min(1.0, delta/10))
-        
-        # Final Composite Reward
-        reward = 0.5*r_sla + 0.25*r_cpu + 0.15*succ + 0.1*r_stab
-        self.reward = reward
+        lat = float(self._latency_p90)
+        cpu = float(self.state[2])
+        replicas = int(self.state[1])
+        succ = float(self._success_ratio)
+    
+        if lat <= 0.020:
+            r_slo = 1.0
+        elif lat <= 0.050:
+            r_slo = 0.5 + 0.5 * (0.050 - lat) / (0.050 - 0.020)
+        else:
+            r_slo = max(-1.0, -0.5 * (lat - 0.050) / 0.1)
+    
+        thpa = float(self.hpa_target)
+        if abs(cpu - thpa) <= 10.0:
+            r_cpu = 1.0
+        else:
+            r_cpu = float(np.exp(-((cpu - thpa) / 50.0) ** 2))
+    
+        delta = abs(replicas - getattr(self, "last_replicas", replicas))
+        if delta <= 2:
+            r_stab = -0.1 * delta
+        else:
+            r_stab = -0.5 * delta
+    
+        # ---- 4) RSucc (paper Eq.8) ----
+        if succ >= 0.99:
+            r_succ = 1.0
+        else:
+            r_succ = float(np.log(max(succ, 1e-6)))
+    
+        w_slo, w_cpu, w_succ, w_stab = 0.50, 0.25, 0.12, 0.08
+        w_sum = w_slo + w_cpu + w_succ + w_stab
+        w_slo, w_cpu, w_succ, w_stab = (w_slo/w_sum, w_cpu/w_sum, w_succ/w_sum, w_stab/w_sum)
+    
+        reward = w_slo * r_slo + w_cpu * r_cpu + w_succ * r_succ + w_stab * r_stab
+    
+        self.reward = float(reward)
         self.last_replicas = replicas
-        return reward
+        return self.reward
 
     def step(self, action):
-        scale_change = int(action) - 1 
-        target_reps = max(MIN_REPLICAS, min(MAX_REPLICAS, self.current_replicas + scale_change))
-        
-        if target_reps != self.current_replicas:
-            subprocess.run(f"kubectl scale deployment {application} --replicas={target_reps} -n {app_env}", shell=True, stdout=subprocess.DEVNULL)
-            self.current_replicas = target_reps
-            time.sleep(2)
-        
+        action_vec = self.decode_action(action)
+        self.apply_multiagent_action(action_vec)
+
         reqs, lat, succ = self.run_hey()
-        
         raw_state = self.get_new_state(reqs, lat, succ)
-        
+
         raw_state[0] = np.clip(raw_state[0], self.low_base[0], self.high_base[0])
         self.state = np.clip(raw_state, self.low_base, self.high_base)
-        
-        self._latency_p90 = lat; self._success_ratio = succ
+
+        self._latency_p90 = lat
+        self._success_ratio = succ
         reward = self.compute_reward()
-        
-        self.steps += 1; self.global_step += 1
-        term = self.steps >= self.days_train * self.max_minutes
-        
+
+        # IMPORTANT: steps resets each day; use global_step for episode length
+        self.steps += 1
+        self.global_step += 1
+        term = self.global_step >= (self.days_train * self.max_minutes)
+
         return self.state, float(reward), term, False, {}
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
-        self.days = 0; self.steps = 0
-        
-        logging.info("Resetting Cluster (Delete HPA, Scale to 1)...")
-        subprocess.run(f"kubectl delete hpa {application} -n {app_env}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(f"kubectl scale deployment {application} --replicas=1 -n {app_env}", shell=True, stdout=subprocess.DEVNULL)
-        time.sleep(5)
-        self.current_replicas = 1
+        self.days = 0
+        self.steps = 0
+        self.global_step = 0
+
+        self.hpa_target = 50
+        self.throughput_multiplier = 1.0
+        self.enhancement = 0
         self.last_replicas = 1
-        
+
+        logging.info("Resetting Cluster (Delete HPA, Scale=1, Recreate HPA@50)...")
+        try:
+            subprocess.run(
+                ["kubectl", "delete", "hpa", application, "-n", app_env],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True
+            )
+        except Exception:
+            pass
+
+        try:
+            subprocess.run(
+                ["kubectl", "scale", "deploy", application, "-n", app_env, "--replicas=1"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True
+            )
+        except Exception:
+            pass
+
+        time.sleep(2)
+
+        try:
+            subprocess.run(
+                ["kubectl", "autoscale", "deploy", application, "-n", app_env,
+                 "--cpu-percent=50", f"--min={MIN_REPLICAS}", f"--max={MAX_REPLICAS}"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, text=True
+            )
+        except Exception:
+            pass
+
+        time.sleep(5)
+
         self.state = np.array([0.05, 1, 30, 40, 100, 1500, 2000, 1, 50, 1.0, 0, 1, 0], dtype=np.float32)
         return self.state, {}
 
@@ -299,10 +389,9 @@ class CSVCallback(BaseCallback):
         super().__init__()
         self.csv_path = csv_path
         self.headers = ["Step", "Reward", "Latency_P90", "Latency_Avg", "Replicas", "CPU_Pct", "Requests", "Success"]
-        
         if csv_path:
             os.makedirs(os.path.dirname(csv_path), exist_ok=True)
-            with open(csv_path, 'w', newline='') as f: 
+            with open(csv_path, 'w', newline='') as f:
                 csv.DictWriter(f, fieldnames=self.headers).writeheader()
 
     def _on_step(self) -> bool:
@@ -312,14 +401,14 @@ class CSVCallback(BaseCallback):
             with open(self.csv_path, 'a', newline='') as f:
                 w = csv.DictWriter(f, fieldnames=self.headers)
                 w.writerow({
-                    "Step": self.num_timesteps, 
-                    "Reward": env.reward, 
-                    "Latency_P90": env._latency_p90*1000, 
-                    "Latency_Avg": env._latency_avg*1000,
-                    "Replicas": int(env.current_replicas), 
-                    "CPU_Pct": s[2], 
-                    "Requests": s[4], 
-                    "Success": env._success_ratio
+                    "Step": self.num_timesteps,
+                    "Reward": env.reward,
+                    "Latency_P90": env._latency_p90 * 1000,
+                    "Latency_Avg": env._latency_avg * 1000,
+                    "Replicas": int(s[1]),        # <-- FIX
+                    "CPU_Pct": float(s[2]),
+                    "Requests": float(s[4]),
+                    "Success": float(env._success_ratio)
                 })
         return True
 
@@ -368,7 +457,8 @@ if __name__ == "__main__":
             buffer_size=50000, 
             exploration_fraction=0.2,
             tensorboard_log=f"{log_dir}/tb_dqn",
-            device=device
+            device=device,
+            verbose=1
         )
         
         cb = CSVCallback(csv_file)
