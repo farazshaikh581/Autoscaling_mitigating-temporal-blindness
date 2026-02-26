@@ -159,17 +159,15 @@ class MultiAgentClusterEnv(gym.Env):
 
     def run_hey(self):
         """Run hey WITHOUT forecasting logic (Fixed AttributeError)."""
-        if self.steps + self.days * self.max_minutes >= len(self.day_list) * self.max_minutes:
-            self.days += 1; 
+        if self.steps >= self.max_minutes:
+            self.days += 1
             self.steps = 0
 
         #try: raw_requests = float(self.invocation_matrix[self.days, self.steps])
         #except: raw_requests = 100.0
 
-        current_day_idx = (self.steps // self.max_minutes) % len(self.day_list)
-        current_min_idx = self.steps % self.max_minutes
-        
-
+        current_day_idx = min(self.days, len(self.day_list) - 1)
+        current_min_idx = self.steps
         raw_requests = float(self.invocation_matrix[current_day_idx, current_min_idx])
 
 
@@ -189,7 +187,6 @@ class MultiAgentClusterEnv(gym.Env):
         # === FIX: REMOVED HISTORY APPEND LOGIC ===
         # This ensures we don't call self.raw_request_history (which doesn't exist in this class)
 
-        # 1 Worker per 50 requests/min. Min 1, Max 20.
         #ideal_workers = math.ceil(raw_requests / 50.0)
         #concurrency = max(1, min(ideal_workers, 20))
         concurrency = max(1, min(int(raw_requests / 10), 10))
@@ -247,16 +244,15 @@ class MultiAgentClusterEnv(gym.Env):
         # --- RETURN 13 DIMS (No Forecast) ---
         return np.array([lat, reps, cpu, ram, eff_req, t_cpu, t_ram, succ, self.hpa_target, self.throughput_multiplier, self.enhancement, math.cos(angle), math.sin(angle)], dtype=np.float32)
 
-    def computereward(self):
-        lat = float(self.latencyp90)      # P90 latency in seconds
-        cpu = float(self.state[2])        # cpu utilization %
-        replicas = float(self.state[1])   # replica count
-        succ = float(self.successratio)   # success ratio in [0,1]
+    def compute_reward(self):
+        lat = float(self._latency_p90)
+        cpu = float(self.state[2])
+        replicas = int(self.state[1])
+        succ = float(self._success_ratio)
     
-        # --- Thresholds
+        # SLA piecewise
         L_TARGET = 0.020
         L_THRESH = 0.050
-    
         if lat <= L_TARGET:
             r_sla = 1.0
         elif lat <= L_THRESH:
@@ -264,38 +260,37 @@ class MultiAgentClusterEnv(gym.Env):
         else:
             r_sla = max(-1.0, -0.5 * (lat - L_THRESH) / 0.1)
     
-        if abs(cpu - float(self.hpatarget)) <= 10.0:
+        # CPU centered at current HPA target
+        thpa = float(self.hpa_target)
+        if abs(cpu - thpa) <= 10.0:
             r_cpu = 1.0
         else:
-            r_cpu = float(np.exp(-((cpu - float(self.hpatarget)) / 50.0) ** 2))
+            r_cpu = float(np.exp(-((cpu - thpa) / 50.0) ** 2))
     
-        delta = abs(float(replicas) - float(self.lastreplicas))
-        if delta <= 2.0:
+        # Stability penalty
+        delta = abs(replicas - int(self.last_replicas))
+        if delta <= 2:
             r_stab = -0.1 * delta
         else:
             r_stab = -0.5 * delta
     
+        # Success term
         if succ >= 0.99:
             r_succ = 1.0
         else:
             r_succ = float(np.log(max(succ, 1e-6)))
     
-        # drop wfcst and renormalize by (1 - 0.05) = 0.95
+        # No-forecast: renormalize weights (drop 0.05 forecast)
         W_SLA  = 0.50 / 0.95
         W_CPU  = 0.25 / 0.95
         W_STAB = 0.08 / 0.95
         W_SUCC = 0.12 / 0.95
     
-        reward = (
-            W_SLA  * r_sla +
-            W_CPU  * r_cpu +
-            W_STAB * r_stab +
-            W_SUCC * r_succ
-        )
+        reward = W_SLA * r_sla + W_CPU * r_cpu + W_STAB * r_stab + W_SUCC * r_succ
     
-        self.currentstepreward = float(reward)
+        self.current_step_reward = float(reward)
         self.reward = float(reward)
-        self.lastreplicas = float(replicas)
+        self.last_replicas = replicas
         return float(reward)
 
     def apply_multiagent_action(self, action):
@@ -324,18 +319,35 @@ class MultiAgentClusterEnv(gym.Env):
         
         reward = self.compute_reward()
         self.steps += 1; self.global_step += 1
-        term = self.steps >= self.days_train * self.max_minutes
-        
+        term = self.global_step >= (self.days_train * self.max_minutes)        
         return self.state, float(reward), term, False, {}
 
     def reset(self, seed=None, options=None):
-        self.days = 0; self.steps = 0;
-        logging.info("Resetting Cluster...")
-        try: subprocess.run(['kubectl', 'scale', 'deploy', application, '-n', app_env, '--replicas=1'], stdout=subprocess.DEVNULL)
-        except: pass
+        self.days = 0
+        self.steps = 0
+        self.global_step = 0
+        self.last_replicas = 1
+    
+        logging.info("Resetting Cluster (Delete HPA, Scale=1, Recreate HPA@50)...")
+    
+        subprocess.run(["kubectl", "delete", "hpa", application, "-n", app_env],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+        subprocess.run(["kubectl", "scale", "deploy", application, "-n", app_env, "--replicas=1"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
+        time.sleep(2)
+    
+        subprocess.run(["kubectl", "autoscale", "deploy", application, "-n", app_env,
+                        "--cpu-percent=50", "--min=1", "--max=200"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    
         time.sleep(5)
-        
-        # 13 Dims
+    
+        self.hpa_target = 50
+        self.throughput_multiplier = 1.0
+        self.enhancement = 0
+    
         self.state = np.array([0.05, 1, 30, 40, 100, 1500, 2000, 1, 50, 1.0, 0, 1, 0], dtype=np.float32)
         return self.state, {}
 
