@@ -36,6 +36,8 @@ torch.use_deterministic_algorithms(True, warn_only=True)
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 
 seed = SEED
+# Although several seed values were explored during our experiments, all reported results in the paper correspond to runs with the random seed fixed at 42.
+
 np.random.seed(seed)
 random.seed(seed)
 torch.manual_seed(seed)
