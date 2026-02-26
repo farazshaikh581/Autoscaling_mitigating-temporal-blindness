@@ -367,10 +367,6 @@ class MultiAgentClusterEnv(gym.Env):
 
     def compute_reward(self):
         # Current metrics
-        lat = float(self.latencyp90)    
-        cpu = float(self.state[2])
-        replicas = float(self.state[1])
-        succ = float(self.successratio)
     
         if lat <= L_TARGET:
             r_sla = 1.0
@@ -381,7 +377,7 @@ class MultiAgentClusterEnv(gym.Env):
             # Hard penalty beyond 50ms (same as your current style)
             r_sla = max(-1.0, -0.5 * (lat - L_THRESH) / 0.1)
     
-        if abs(cpu - float(self.hpatarget)) <= 10.0:
+        if abs(cpu - float(self.hpa_target)) <= 10.0:
             r_cpu = 1.0
         else:
             r_cpu = float(np.exp(-((cpu - float(self.hpatarget)) / 50.0) ** 2))
@@ -393,7 +389,7 @@ class MultiAgentClusterEnv(gym.Env):
             r_stab = -0.5 * delta
     
         effreq = float(self.state[4])   
-        Nt = float(self.forecastrunningavg)
+        Nt = float(self.forecast_running_avg)
         
         C = float(NOMINAL_CAP_PER_REPLICA)
         err = (effreq - Nt) / max(C, 1e-6)
@@ -565,7 +561,7 @@ class TensorboardCallback(BaseCallback):
             
         return True
 
-def cosine_schedule(progress): return 2e-4 * 0.5 * (1 + np.cos(np.pi * (1 - progress)))
+def lr_schedule(progress): return 2e-4 * 0.5 * (1 + np.cos(np.pi * (1 - progress)))
 
 if __name__ == "__main__":
     import argparse
