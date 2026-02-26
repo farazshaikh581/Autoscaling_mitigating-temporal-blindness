@@ -65,6 +65,14 @@ NR_REQUESTS_MAX = 3000
 FORECAST_WINDOW = 3
 MINUTES_PER_DAY = 500 
 
+W_SLA  = 0.50
+W_CPU  = 0.25
+W_STAB = 0.08
+W_FCST = 0.05
+W_SUCC = 0.12
+L_TARGET = 0.020
+L_THRESH = 0.050
+
 # === ARCHITECTURE SETTINGS ===
 # We use a window to give the Attention mechanism a sequence to look at.
   
@@ -95,7 +103,7 @@ class AttentionDoubleLSTM(BaseFeaturesExtractor):
             hidden_size=self.hidden_dim, 
             num_layers=2,       # Double Stacked
             batch_first=True, 
-            dropout=0.2
+            dropout=0.1
         )
         
         # 3. Attention Mechanism (The "Proposed" Improvement)
@@ -258,7 +266,7 @@ class MultiAgentClusterEnv(gym.Env):
 
 
         # ============================================
-        # FIX: TRUE IDLE MODE (Prevents Timeout Crash)
+        # TRUE IDLE MODE (Prevents Timeout Crash)
         # ============================================
         # Only truly idle if no requests at all
         if raw_requests < 1.0:
@@ -358,23 +366,58 @@ class MultiAgentClusterEnv(gym.Env):
         return np.array([lat, reps, cpu, ram, eff_req, t_cpu, t_ram, succ, self.hpa_target, self.throughput_multiplier, self.enhancement, math.cos(angle), math.sin(angle), self.forecast_running_avg], dtype=np.float32)
 
     def compute_reward(self):
-        lat = self._latency_p90
-        cpu = self.state[2]
-        replicas = self.state[1]
-        succ = self._success_ratio
+        # Current metrics
+        lat = float(self.latencyp90)    
+        cpu = float(self.state[2])
+        replicas = float(self.state[1])
+        succ = float(self.successratio)
+    
+        if lat <= L_TARGET:
+            r_sla = 1.0
+        elif lat <= L_THRESH:
+            # Linear decay from 1.0 -> 0.5 between 20ms and 50ms (same as your current style)
+            r_sla = 0.5 + 0.5 * (L_THRESH - lat) / (L_THRESH - L_TARGET)
+        else:
+            # Hard penalty beyond 50ms (same as your current style)
+            r_sla = max(-1.0, -0.5 * (lat - L_THRESH) / 0.1)
+    
+        if abs(cpu - float(self.hpatarget)) <= 10.0:
+            r_cpu = 1.0
+        else:
+            r_cpu = float(np.exp(-((cpu - float(self.hpatarget)) / 50.0) ** 2))
+    
+        delta = abs(float(replicas) - float(self.lastreplicas))
+        if delta <= 2.0:
+            r_stab = -0.1 * delta
+        else:
+            r_stab = -0.5 * delta
+    
+        effreq = float(self.state[4])   
+        Nt = float(self.forecastrunningavg)
         
-        if lat <= 0.020: r_sla = 1.0
-        elif lat <= 0.050: r_sla = 0.5 + 0.5 * (0.050 - lat) / 0.030
-        else: r_sla = max(-1.0, -0.5 * (lat - 0.050) / 0.1)
-        
-        r_cpu = 1.0 if abs(cpu - self.hpa_target) <= 10 else np.exp(-((cpu - self.hpa_target)/50)**2)
-        delta = abs(replicas - self.last_replicas)
-        r_stab = 0.5 if delta == 0 else (0.3 if delta <=2 else -0.2 * min(1.0, delta/10))
-        
-        reward = 0.5*r_sla + 0.25*r_cpu + 0.15*succ + 0.1*r_stab
-        self.current_step_reward = reward; self.reward = reward; self.last_replicas = replicas
-        return reward
+        C = float(NOMINAL_CAP_PER_REPLICA)
+        err = (effreq - Nt) / max(C, 1e-6)
+        r_fcst = -(err ** 2)
+    
+        if succ >= 0.99:
+            r_succ = 1.0
+        else:
+            r_succ = float(np.log(max(succ, 1e-6)))
+    
+        reward = (
+            W_SLA  * r_sla +
+            W_CPU  * r_cpu +
+            W_STAB * r_stab +
+            W_FCST * r_fcst +
+            W_SUCC * r_succ
+        )
+    
+        self.currentstepreward = float(reward)
+        self.reward = float(reward)
+        self.lastreplicas = float(replicas)
+        return float(reward)
 
+    
     def apply_multiagent_action(self, action):
         opts = [30, 50, 70, 90]
         new_t = opts[int(action[0]) % 4]
@@ -432,7 +475,7 @@ class MultiAgentClusterEnv(gym.Env):
         time.sleep(2)
         subprocess.run([
             'kubectl', 'autoscale', 'deploy', application, '-n', app_env, 
-            '--cpu-percent=50', '--min=1', '--max=30'
+            '--cpu-percent=50', '--min=1', '--max=200'
         ], stdout=subprocess.DEVNULL)
         
         logging.info("✅ Cluster Reset: HPA Created (50%), Replicas=1")
@@ -569,7 +612,7 @@ if __name__ == "__main__":
         model = PPO(
             "MlpPolicy", vec_train, verbose=1, device='cuda',
             policy_kwargs=dict(features_extractor_class=AttentionDoubleLSTM, features_extractor_kwargs=dict(features_dim=256)),
-            learning_rate=3e-4, n_steps=128, batch_size=128, n_epochs=10, tensorboard_log=f"{log_dir}/tb"
+            learning_rate=lr_schedule, n_steps=512, n_epochs=10, gae_lambda=0.93, ent_coef=0.01, tensorboard_log=f"{log_dir}/tb"
         )
         #reset_timestep = True
         
