@@ -35,7 +35,7 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 torch.use_deterministic_algorithms(True, warn_only=True)
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 
-seed = 42
+seed = SEED
 np.random.seed(seed)
 random.seed(seed)
 torch.manual_seed(seed)
@@ -138,7 +138,7 @@ def add_day_column(df, minutes_per_day=MINUTES_PER_DAY):
     df['day'] = (df['minute'] // minutes_per_day).astype(int)
     return df
 
-def get_random_days(df, n_days=7, train_days=5, test_days=2, seed=42):
+def get_random_days(df, n_days=7, train_days=5, test_days=2, seed=SEED):
     all_days = sorted(df.day.unique())
     n_days = min(n_days, len(all_days))
     random.seed(seed)
