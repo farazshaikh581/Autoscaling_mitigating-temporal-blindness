@@ -119,41 +119,57 @@ class StaticBenchmark:
         except: return 1, 1, 1, 1
 
     def run_hey(self):
-        # === EXACT PPO LOGIC ===
-        if self.steps + self.days * self.max_minutes >= len(self.day_list) * self.max_minutes:
-             self.days += 1; self.steps = 0
-
-        current_day_idx = (self.steps // self.max_minutes) % len(self.day_list)
-        current_min_idx = self.steps % self.max_minutes
-        
+        # --- Day/Step cycling ---
+        # When we finish one day (500 minutes), move to next test day
+        if self.steps >= self.max_minutes:
+            self.days += 1
+            self.steps = 0
+    
+        # If all test days are finished, behave like idle (end-of-trace)
+        if self.days >= len(self.day_list):
+            logging.info("All test days completed.")
+            time.sleep(60)
+            return 0.0, 0.005, 0.005, 1.0
+    
+        current_day_idx = self.days
+        current_min_idx = self.steps
+    
+        # 1) Get raw demand
         try:
             raw_requests = float(self.invocation_matrix[current_day_idx, current_min_idx])
-        except:
+        except Exception:
             raw_requests = 100.0
-
-        # === 1. IDLE MODE ===
+    
+        # 2) Idle mode
         if raw_requests < 1.0:
             logging.info(f"Step {self.steps}: Trace=0 | Idle Mode (Sleeping 60s)")
             time.sleep(60)
             return 0.0, 0.005, 0.005, 1.0
-
-        # === 2. ACTIVE MODE ===
+    
+        # 3) Active mode (same pacing structure; throughput fixed at 1.0)
         concurrency = max(1, min(int(raw_requests / 10), 10))
-        target_qps = raw_requests / 60.0
+        throughput_multiplier = 1.0
+        target_qps = (raw_requests * throughput_multiplier) / 60.0
         work_param = 1000000016000000063
-        
-        command = f"hey -c {concurrency} -q {max(0.001, target_qps):.4f} -z 60s -m GET {self.service_url}factor?n={work_param}"
-        
-        logging.info(f"Step {self.steps}: Trace={raw_requests:.0f} | Workers={concurrency} | QPS={target_qps:.2f}")
-
-        lat_p90, lat_avg, success = 1, 1, 0.0
+    
+        command = (
+            f"hey -c {concurrency} -q {max(0.001, target_qps):.4f} -z 60s "
+            f"-m GET {self.service_url}factor?n={work_param}"
+        )
+    
+        logging.info(
+            f"Step {self.steps}: Trace={raw_requests:.0f} | "
+            f"DayIdx={current_day_idx} MinIdx={current_min_idx} | "
+            f"Workers={concurrency} | QPS={target_qps:.2f}"
+        )
+    
+        lat_p90, lat_avg, success = 1.0, 1.0, 0.0
         try:
             output = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=80)
             lat_p90, lat_avg, success = self._parse_hey(output.stdout + "\n" + output.stderr)
         except Exception as e:
             logging.error(f"Hey error: {e}")
-            self._latency_p90 = 1.0; self._latency_avg = 1.0; self._success_ratio = 0.0
-
+    
         return raw_requests, lat_p90, lat_avg, success
 
     def _parse_hey(self, output):
@@ -183,6 +199,8 @@ class StaticBenchmark:
         logging.info("✅ Static HPA (50%) Applied.")
         time.sleep(10)
 
+
+  
     def run_loop(self):
         total_steps = len(self.day_list) * self.max_minutes
         logging.info(f"🚀 Starting Static Benchmark for {total_steps} steps...")
