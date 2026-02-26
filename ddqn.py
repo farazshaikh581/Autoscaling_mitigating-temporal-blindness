@@ -50,6 +50,8 @@ MINUTES_PER_DAY = 500
 FORECAST_WINDOW = 3
 SEED = SEED
 
+# Although several seed values were explored during our experiments, all reported results in the paper correspond to runs with the random seed fixed at 42.
+
 np.random.seed(SEED)
 random.seed(SEED)
 torch.manual_seed(SEED)
