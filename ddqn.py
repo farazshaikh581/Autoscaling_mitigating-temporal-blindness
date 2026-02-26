@@ -48,7 +48,7 @@ MIN_REPLICAS = 1
 MAX_REPLICAS = 30 
 MINUTES_PER_DAY = 500 
 FORECAST_WINDOW = 3
-SEED = 42
+SEED = SEED
 
 np.random.seed(SEED)
 random.seed(SEED)
@@ -63,7 +63,7 @@ def add_day_column(df, minutes_per_day=MINUTES_PER_DAY):
     df['day'] = (df['minute'] // minutes_per_day).astype(int)
     return df
 
-def get_random_days(df, n_days=7, train_days=5, test_days=2, seed=42):
+def get_random_days(df, n_days=7, train_days=5, test_days=2, seed=SEED):
     all_days = sorted(df.day.unique())
     n_days = min(n_days, len(all_days))
     random.seed(seed)
