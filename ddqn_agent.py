@@ -451,16 +451,15 @@ if __name__ == "__main__":
         env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.)
         
         model = DQN(
-            "MlpPolicy", 
-            env, 
-            verbose=1, 
-            learning_rate=3e-4, 
-            gamma=0.99, 
-            buffer_size=50000, 
+            "MlpPolicy",
+            env,
+            verbose=1,
+            learning_rate=3e-4,
+            gamma=0.99,
+            buffer_size=50000,
             exploration_fraction=0.2,
             tensorboard_log=f"{log_dir}/tb_dqn",
             device=device,
-            verbose=1
         )
         
         cb = CSVCallback(csv_file)

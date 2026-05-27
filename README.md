@@ -84,8 +84,8 @@ AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt
 
 ```bash
 # Build and push the container image
-docker build -t <your-registry>/factorizator:latest .
-docker push <your-registry>/factorizator:latest
+docker build -t DOCKERHUB_USERNAME/factorizator:latest .
+docker push DOCKERHUB_USERNAME/factorizator:latest
 
 # Deploy to Kubernetes
 kubectl apply -f factorizator-namespace.yaml
@@ -101,7 +101,7 @@ kubectl get pods -n factorizator
 ### 4. Expose the service
 
 ```bash
-kubectl port-forward svc/factorizator-service 8080:8080 -n factorizator &
+kubectl port-forward svc/factorizator 8080:8080 -n factorizator &
 curl http://localhost:8080/health
 ```
 
