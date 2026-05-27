@@ -84,10 +84,10 @@ AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt
 
 ```bash
 # Build and push the container image
-docker build -t DOCKERHUB_USERNAME/factorizator:latest .
-docker push DOCKERHUB_USERNAME/factorizator:latest
+docker build -t <your-dockerhub-username>/factorizator:latest .
+docker push <your-dockerhub-username>/factorizator:latest
 
-# Deploy to Kubernetes
+# Update the image field in factorizator-deployment.yaml to match your registry, then deploy
 kubectl apply -f factorizator-namespace.yaml
 kubectl apply -f factorizator-deployment.yaml
 kubectl apply -f factorizator-service.yaml
