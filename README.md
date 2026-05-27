@@ -181,12 +181,11 @@ All results in the paper use random seed 42 (`SEED = 42` in all scripts). 7 days
 ## Citation
 
 ```bibtex
-@article{shaikh2025temporal,
-  title     = {Mitigating Temporal Blindness in Kubernetes Autoscaling:
-               An Attention-Double-LSTM Framework},
-  author    = {Shaikh, Faraz, Reali, Gianluca, and Femminella, Mauro},
-  journal   = {(under review / to appear)},
-  year      = {2026}
+@article{shaikh2026temporal,
+  title   = {Mitigating Temporal Blindness in Kubernetes Autoscaling: An Attention-Double-LSTM Framework},
+  author  = {Shaikh, Faraz and Reali, Gianluca and Femminella, Mauro},
+  journal = {(under review / to appear)},
+  year    = {2026}
 }
 ```
 
