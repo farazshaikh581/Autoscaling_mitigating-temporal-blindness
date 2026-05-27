@@ -64,6 +64,8 @@ Code, configuration files, and result logs for the experiments in the paper. Fou
 ```bash
 git clone https://github.com/farazshaikh581/Autoscaling_mitigating-temporal-blindness.git
 cd Autoscaling_mitigating-temporal-blindness
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -141,9 +143,10 @@ python static-hpa50.py --url http://localhost:8080
 ### Launch script
 
 ```bash
-# Usage: ./launch_experiment.sh [profile] [run_id] [seed]
+# Usage: ./launch_experiment.sh <agent> <url> [mode] [seed]
 chmod +x launch_experiment.sh
-./launch_experiment.sh perf_focused 1 42
+./launch_experiment.sh double-lstm http://localhost:8080 train 42
+./launch_experiment.sh double-lstm http://localhost:8080 test 42
 ```
 
 ---
