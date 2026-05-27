@@ -26,9 +26,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 application = "factorizator"
 app_env = "factorizator"
 MINUTES_PER_DAY = 500 
-SEED = SEED
-
-# Although several seed values were explored during our experiments, all reported results in the paper correspond to runs with the random seed fixed at 42.
+SEED = 42  # All reported results in the paper use this fixed seed
 
 # Global Seeding
 np.random.seed(SEED)

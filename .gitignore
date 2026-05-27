@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+dist/
+build/
+venv/
+env/
+.venv/
+
+# Dataset (305 MB — download link is in "Invocation Traces")
+AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt
+
+# Training artifacts
+runs/
+tensorboard_logs/
+*.zip
+
+# Logs
+*.log
+logs/
+
+# Results (intermediate / local)
+results/
+results_log/
+tmp/
+
+# OS
+.DS_Store
+Thumbs.db
