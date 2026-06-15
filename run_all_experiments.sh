@@ -115,7 +115,7 @@ log "ntfy topic: $NTFY_TOPIC"
 log "Est. total: ~32 days (running unattended)"
 log "Pipeline log: $PIPELINE_LOG"
 
-notify "Pipeline STARTED" "URL: $URL | Seeds: ${SEEDS[*]} | Est. ~32 days | Order: HPA → DRQN → Single-LSTM → Double-LSTM" "default" "rocket"
+notify "Pipeline STARTED" "URL: $URL | Seeds: ${SEEDS[*]} | Est. ~32 days | Order: HPA → DDQN → Single-LSTM → Double-LSTM" "default" "rocket"
 
 # =============================================================================
 # PHASE 1 — Static HPA  (evaluation only, ~17h per seed)
@@ -149,49 +149,49 @@ notify "Phase 1/4 COMPLETE: Static HPA" "All 4 seeds done | Took $(dur $(( SECON
 log "Phase 1 complete in $(dur $(( SECONDS - PHASE1_START )))"
 
 # =============================================================================
-# PHASE 2 — DRQN  (4 seeds, ~58h each, ~232h total)
+# PHASE 2 — DDQN  (4 seeds, ~58h each, ~232h total)
 # =============================================================================
-sep "PHASE 2/4: DRQN — Deep Recurrent Q-Network (4 seeds, ~232h total)"
-notify "Phase 2/4 START: DRQN" "4 seeds × ~58h | LSTM inside Q-network | Est. ~232h (~10 days)" "default" "hourglass_flowing_sand"
+sep "PHASE 2/4: DDQN — Double Deep Q-Network (4 seeds, ~232h total)"
+notify "Phase 2/4 START: DDQN" "4 seeds × ~58h | Fixed action space + target network | Est. ~232h (~10 days)" "default" "hourglass_flowing_sand"
 PHASE2_START=$SECONDS
 
 for i in "${!SEEDS[@]}"; do
     SEED="${SEEDS[$i]}"
-    OUT="$RESULTS/drqn/seed${SEED}"
+    OUT="$RESULTS/ddqn/seed${SEED}"
     mkdir -p "$OUT"
     SEED_START=$SECONDS
 
-    log "DRQN | seed=$SEED | TRAIN"
-    notify "DRQN seed=$SEED TRAIN START" "Seed $((i+1))/${#SEEDS[@]} | ~41h" "low" "hourglass"
+    log "DDQN | seed=$SEED | TRAIN"
+    notify "DDQN seed=$SEED TRAIN START" "Seed $((i+1))/${#SEEDS[@]} | ~41h" "low" "hourglass"
 
-    if run_step "$OUT/train.log" drqn_agent.py \
+    if run_step "$OUT/train.log" ddqn_agent.py \
             --mode train --url "$URL" --seed "$SEED" --log-dir "$OUT"; then
         TRAIN_TIME=$(( SECONDS - SEED_START ))
-        log "DRQN seed=$SEED training done in $(dur $TRAIN_TIME)"
-        notify "DRQN seed=$SEED TRAIN DONE ✓" "Took $(dur $TRAIN_TIME) | Starting test" "low" "white_check_mark"
+        log "DDQN seed=$SEED training done in $(dur $TRAIN_TIME)"
+        notify "DDQN seed=$SEED TRAIN DONE ✓" "Took $(dur $TRAIN_TIME) | Starting test" "low" "white_check_mark"
     else
-        notify "DRQN seed=$SEED TRAIN FAILED ✗" "Check $OUT/train.log — skipping test for this seed" "high" "warning"
-        log "WARNING: DRQN seed=$SEED training failed — skipping test"
+        notify "DDQN seed=$SEED TRAIN FAILED ✗" "Check $OUT/train.log — skipping test for this seed" "high" "warning"
+        log "WARNING: DDQN seed=$SEED training failed — skipping test"
         continue
     fi
 
-    log "DRQN | seed=$SEED | TEST"
-    notify "DRQN seed=$SEED TEST START" "~17h | LSTM state carried between steps" "low" "hourglass"
+    log "DDQN | seed=$SEED | TEST"
+    notify "DDQN seed=$SEED TEST START" "~17h" "low" "hourglass"
     TEST_START=$SECONDS
 
-    if run_step "$OUT/test.log" drqn_agent.py \
+    if run_step "$OUT/test.log" ddqn_agent.py \
             --mode test --url "$URL" --seed "$SEED" --log-dir "$OUT"; then
         SEED_TIME=$(( SECONDS - SEED_START ))
         PHASE_ELAPSED=$(( SECONDS - PHASE2_START ))
-        notify "DRQN seed=$SEED DONE ✓" "Took $(dur $SEED_TIME) | Seed $((i+1))/${#SEEDS[@]} | ETA remaining: $(eta $PHASE_ELAPSED $(( i+1 )) $(( ${#SEEDS[@]} - i - 1 )))" "default" "white_check_mark"
-        log "DRQN seed=$SEED complete in $(dur $SEED_TIME)"
+        notify "DDQN seed=$SEED DONE ✓" "Took $(dur $SEED_TIME) | Seed $((i+1))/${#SEEDS[@]} | ETA remaining: $(eta $PHASE_ELAPSED $(( i+1 )) $(( ${#SEEDS[@]} - i - 1 )))" "default" "white_check_mark"
+        log "DDQN seed=$SEED complete in $(dur $SEED_TIME)"
     else
-        notify "DRQN seed=$SEED TEST FAILED ✗" "Check $OUT/test.log" "high" "warning"
-        log "WARNING: DRQN seed=$SEED test failed"
+        notify "DDQN seed=$SEED TEST FAILED ✗" "Check $OUT/test.log" "high" "warning"
+        log "WARNING: DDQN seed=$SEED test failed"
     fi
 done
 
-notify "Phase 2/4 COMPLETE: DRQN" "All 4 seeds done | Took $(dur $(( SECONDS - PHASE2_START )))" "default" "white_check_mark,tada"
+notify "Phase 2/4 COMPLETE: DDQN" "All 4 seeds done | Took $(dur $(( SECONDS - PHASE2_START )))" "default" "white_check_mark,tada"
 log "Phase 2 complete in $(dur $(( SECONDS - PHASE2_START )))"
 
 # =============================================================================

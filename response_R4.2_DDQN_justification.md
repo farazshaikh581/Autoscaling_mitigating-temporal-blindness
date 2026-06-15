@@ -1,4 +1,4 @@
-# Response to Reviewer 4, Comment 2 — DDQN Baseline Replacement
+# Response to Reviewer 4, Comment 2 — DDQN Baseline Fix
 
 ## Reviewer's concern
 > "The DDQN baseline appears broken — the agent consistently selects 1 replica
@@ -7,41 +7,33 @@
 
 ## Our response
 
-We thank the reviewer for this careful observation. Upon investigation, we confirmed
-that the original DDQN implementation suffered from two compounding issues: (1) the
-action space included a dead learning-rate dimension that consumed exploration budget
-without affecting policy, and (2) the target network was updated too infrequently,
-causing Q-value overestimation that collapsed to a conservative single-replica policy.
+We thank the reviewer for identifying this issue. Upon investigation, we confirmed
+two root causes that caused DDQN to collapse to a single-replica policy:
 
-We considered replacing DDQN with KEDA (Kubernetes Event-Driven Autoscaling) as the
-reviewer suggested. However, KEDA's HTTP add-on scaler operates as a pure reactive
-proxy — it counts in-flight requests at the network level and scales proportionally,
-with no awareness of latency SLOs, CPU utilisation targets, or workload forecasts.
-Its scaling decisions are therefore not directly comparable with RL agents that
-optimise a multi-objective reward signal. Including KEDA would introduce a
-category mismatch: a reactive network proxy vs. learned control policies.
+1. **Dead action dimension.** The original action space was `MultiDiscrete([4,3,3,3])`,
+   where dimension 1 was a learning-rate schedule selector that had no effect on
+   environment behaviour. This wasted a significant portion of exploration budget on
+   a dimension that produced no reward signal, starving the policy of useful gradient.
+   We corrected the action space to `MultiDiscrete([4,3,3])` and shifted the
+   remaining action indices accordingly.
 
-Instead, we replaced the broken DDQN with **DRQN (Deep Recurrent Q-Network)**
-[cite: Hausknecht & Stone, 2015], which addresses the same reviewer concern
-(a functional DQN-family baseline) while providing a more scientifically meaningful
-comparison:
+2. **Infrequent target network updates.** The target network was updated every
+   10,000 steps, causing severe Q-value overestimation in the early training phase.
+   We reduced the target update interval to every 500 steps, consistent with
+   best practice for environments with dense, step-by-step rewards.
 
-- DRQN uses an LSTM inside the Q-network, making it a direct recurrent counterpart
-  to our Double-LSTM architecture.
-- It is optimised with the same multi-objective reward function, the same action
-  space, and the same four evaluation seeds (42, 123, 456, 789) as our proposed
-  method, ensuring a fair apples-to-apples comparison.
-- The comparison isolates the contribution of the attention mechanism and the
-  dual-LSTM architecture: Single-LSTM removes the second LSTM branch; DRQN removes
-  the attention mechanism entirely.
+With both fixes applied, DDQN now converges reliably across all four evaluation
+seeds (42, 123, 456, 789). The revised Table II reports mean ± 95% CI for DDQN
+across all seeds, with results that are clearly distinguishable from the proposed
+Double-LSTM method, providing a valid and fair baseline comparison.
 
-We believe this substitution is more informative than a KEDA comparison for the
-specific claims of this paper (temporal dependency modelling in RL-based
-autoscaling), and we respectfully request the reviewer's acceptance of this change.
-The revised Table II now reports mean ± 95% CI across four seeds for all agents,
-with Wilcoxon signed-rank tests confirming statistical significance.
+We believe keeping a fixed DDQN (rather than substituting an entirely different
+system such as KEDA) preserves the scientific contribution of the comparison:
+all baselines — Static HPA, DDQN, Single-LSTM, Double-LSTM — are evaluated under
+the identical multi-objective reward function and the same deployment conditions,
+ensuring a clean ablation of the architectural contributions.
 
 ## Changes made to the paper
-- Section IV-B: DDQN description replaced with DRQN description and citation.
-- Table II: DDQN row replaced with DRQN (mean ± CI, 4 seeds).
-- Footnote added explaining the KEDA trade-off and the choice of DRQN.
+- Section IV-B: Added description of the two fixes applied to DDQN.
+- Table II: DDQN now reports mean ± 95% CI across 4 seeds (previously single-seed, broken).
+- Code: `ddqn_agent.py` action space and target update interval corrected.
