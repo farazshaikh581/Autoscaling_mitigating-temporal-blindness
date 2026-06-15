@@ -101,27 +101,27 @@ except Exception as e:
 
 PIPELINE_START=$SECONDS
 # Estimated total wall-clock time at 60s/step:
-#  Static HPA:   5 seeds × 1000 steps =  5000 steps ≈  83h
-#  DDQN:         1 seed  × 3500 steps =  3500 steps ≈  58h
-#  Single-LSTM:  5 seeds × 3500 steps = 17500 steps ≈ 292h
-#  Double-LSTM:  5 seeds × 3500 steps = 17500 steps ≈ 292h
-#  Total ≈ 725h ≈ 30 days
+#  Static HPA:   4 seeds × 1000 steps =  4000 steps ≈  68h
+#  DRQN:         4 seeds × 3500 steps = 14000 steps ≈ 232h
+#  Single-LSTM:  4 seeds × 3500 steps = 14000 steps ≈ 232h
+#  Double-LSTM:  4 seeds × 3500 steps = 14000 steps ≈ 232h
+#  Total ≈ 764h ≈ 32 days
 
 sep "EXPERIMENT PIPELINE START"
 log "Cluster   : $CLUSTER_NAME"
 log "URL       : $URL"
 log "Seeds     : ${SEEDS[*]}"
 log "ntfy topic: $NTFY_TOPIC"
-log "Est. total: ~30 days (running unattended)"
+log "Est. total: ~32 days (running unattended)"
 log "Pipeline log: $PIPELINE_LOG"
 
-notify "Pipeline STARTED" "URL: $URL | Seeds: ${SEEDS[*]} | Est. ~25 days | Order: HPA → DDQN → DRQN → Single-LSTM → Double-LSTM" "default" "rocket"
+notify "Pipeline STARTED" "URL: $URL | Seeds: ${SEEDS[*]} | Est. ~32 days | Order: HPA → DRQN → Single-LSTM → Double-LSTM" "default" "rocket"
 
 # =============================================================================
 # PHASE 1 — Static HPA  (evaluation only, ~17h per seed)
 # =============================================================================
-sep "PHASE 1/4: Static HPA (5 seeds, ~83h total)"
-notify "Phase 1/4 START: Static HPA" "5 seeds × ~17h each | Est. ~83h" "default" "hourglass_flowing_sand"
+sep "PHASE 1/4: Static HPA (4 seeds, ~68h total)"
+notify "Phase 1/4 START: Static HPA" "4 seeds × ~17h each | Est. ~68h" "default" "hourglass_flowing_sand"
 PHASE1_START=$SECONDS
 
 for i in "${!SEEDS[@]}"; do
@@ -145,59 +145,15 @@ for i in "${!SEEDS[@]}"; do
     fi
 done
 
-notify "Phase 1/4 COMPLETE: Static HPA" "All 5 seeds done | Took $(dur $(( SECONDS - PHASE1_START )))" "default" "white_check_mark,tada"
+notify "Phase 1/4 COMPLETE: Static HPA" "All 4 seeds done | Took $(dur $(( SECONDS - PHASE1_START )))" "default" "white_check_mark,tada"
 log "Phase 1 complete in $(dur $(( SECONDS - PHASE1_START )))"
 
 # =============================================================================
-# PHASE 2 — DDQN  (convergence test — seed 42 only, ~58h)
+# PHASE 2 — DRQN  (4 seeds, ~58h each, ~232h total)
 # =============================================================================
-sep "PHASE 2/4: Double DQN (seed 42, ~58h)"
-notify "Phase 2/4 START: Double DQN" "1 seed (convergence test) | Train ~41h + Test ~17h" "default" "hourglass_flowing_sand"
+sep "PHASE 2/4: DRQN — Deep Recurrent Q-Network (4 seeds, ~232h total)"
+notify "Phase 2/4 START: DRQN" "4 seeds × ~58h | LSTM inside Q-network | Est. ~232h (~10 days)" "default" "hourglass_flowing_sand"
 PHASE2_START=$SECONDS
-DDQN_FAILED=0
-
-OUT="$RESULTS/ddqn/seed42"
-mkdir -p "$OUT"
-
-log "DDQN | seed=42 | TRAIN"
-notify "DDQN seed=42 TRAIN START" "~41h | Fixed: target_update=500, Discrete(36), learning_starts=50" "low" "hourglass"
-SEED_START=$SECONDS
-
-if run_step "$OUT/train.log" ddqn_agent.py \
-        --mode train --url "$URL" --seed 42 --log-dir "$OUT"; then
-    TRAIN_TIME=$(( SECONDS - SEED_START ))
-    log "DDQN training done in $(dur $TRAIN_TIME)"
-    notify "DDQN TRAIN DONE ✓" "Took $(dur $TRAIN_TIME) | Starting evaluation now" "default" "white_check_mark"
-
-    log "DDQN | seed=42 | TEST"
-    notify "DDQN seed=42 TEST START" "~17h" "low" "hourglass"
-    TEST_START=$SECONDS
-    if run_step "$OUT/test.log" ddqn_agent.py \
-            --mode test --url "$URL" --seed 42 --log-dir "$OUT"; then
-        TEST_TIME=$(( SECONDS - TEST_START ))
-        log "DDQN evaluation done in $(dur $TEST_TIME)"
-        notify "DDQN COMPLETE ✓" "Train: $(dur $TRAIN_TIME) | Test: $(dur $TEST_TIME) | Check CSV for replica counts — if stuck at 1 replica, KEDA will replace." "high" "white_check_mark,eyes"
-    else
-        DDQN_FAILED=1
-        notify "DDQN TEST FAILED ✗" "Check $OUT/test.log — pipeline continuing to Single-LSTM" "high" "warning"
-        log "WARNING: DDQN test failed"
-    fi
-else
-    DDQN_FAILED=1
-    notify "DDQN TRAIN FAILED ✗" "Check $OUT/train.log — pipeline continuing to Single-LSTM. KEDA replacement may be needed." "urgent" "warning,eyes"
-    log "WARNING: DDQN training failed — continuing pipeline"
-fi
-
-[ "$DDQN_FAILED" -eq 1 ] && log "DDQN failed — will need manual review before paper submission"
-log "Phase 2 complete in $(dur $(( SECONDS - PHASE2_START )))"
-notify "Phase 2/5 COMPLETE: DDQN" "Took $(dur $(( SECONDS - PHASE2_START ))) | DDQN_FAILED=$DDQN_FAILED | Moving to DRQN" "default" "white_check_mark"
-
-# =============================================================================
-# PHASE 3 — DRQN  (4 seeds, ~58h each, ~232h total)
-# =============================================================================
-sep "PHASE 3/5: DRQN — Deep Recurrent Q-Network (4 seeds, ~232h total)"
-notify "Phase 3/5 START: DRQN" "4 seeds × ~58h | LSTM inside Q-network | Est. ~232h (~10 days)" "default" "hourglass_flowing_sand"
-PHASE3_START=$SECONDS
 
 for i in "${!SEEDS[@]}"; do
     SEED="${SEEDS[$i]}"
@@ -226,7 +182,7 @@ for i in "${!SEEDS[@]}"; do
     if run_step "$OUT/test.log" drqn_agent.py \
             --mode test --url "$URL" --seed "$SEED" --log-dir "$OUT"; then
         SEED_TIME=$(( SECONDS - SEED_START ))
-        PHASE_ELAPSED=$(( SECONDS - PHASE3_START ))
+        PHASE_ELAPSED=$(( SECONDS - PHASE2_START ))
         notify "DRQN seed=$SEED DONE ✓" "Took $(dur $SEED_TIME) | Seed $((i+1))/${#SEEDS[@]} | ETA remaining: $(eta $PHASE_ELAPSED $(( i+1 )) $(( ${#SEEDS[@]} - i - 1 )))" "default" "white_check_mark"
         log "DRQN seed=$SEED complete in $(dur $SEED_TIME)"
     else
@@ -235,14 +191,14 @@ for i in "${!SEEDS[@]}"; do
     fi
 done
 
-notify "Phase 3/5 COMPLETE: DRQN" "All 4 seeds done | Took $(dur $(( SECONDS - PHASE3_START )))" "default" "white_check_mark,tada"
-log "Phase 3 complete in $(dur $(( SECONDS - PHASE3_START )))"
+notify "Phase 2/4 COMPLETE: DRQN" "All 4 seeds done | Took $(dur $(( SECONDS - PHASE2_START )))" "default" "white_check_mark,tada"
+log "Phase 2 complete in $(dur $(( SECONDS - PHASE2_START )))"
 
 # =============================================================================
-# PHASE 4 — Single-LSTM  (4 seeds, ~58h each, ~232h total)
+# PHASE 3 — Single-LSTM  (4 seeds, ~58h each, ~232h total)
 # =============================================================================
-sep "PHASE 4/5: Single-LSTM ablation (4 seeds, ~232h total)"
-notify "Phase 4/5 START: Single-LSTM" "4 seeds × ~58h each | Est. ~232h (~10 days)" "default" "hourglass_flowing_sand"
+sep "PHASE 3/4: Single-LSTM ablation (4 seeds, ~232h total)"
+notify "Phase 3/4 START: Single-LSTM" "4 seeds × ~58h each | Est. ~232h (~10 days)" "default" "hourglass_flowing_sand"
 PHASE3_START=$SECONDS
 
 for i in "${!SEEDS[@]}"; do
@@ -281,14 +237,14 @@ for i in "${!SEEDS[@]}"; do
     fi
 done
 
-notify "Phase 4/5 COMPLETE: Single-LSTM" "All 4 seeds done | Took $(dur $(( SECONDS - PHASE3_START )))" "default" "white_check_mark,tada"
-log "Phase 4 complete in $(dur $(( SECONDS - PHASE3_START )))"
+notify "Phase 3/4 COMPLETE: Single-LSTM" "All 4 seeds done | Took $(dur $(( SECONDS - PHASE3_START )))" "default" "white_check_mark,tada"
+log "Phase 3 complete in $(dur $(( SECONDS - PHASE3_START )))"
 
 # =============================================================================
-# PHASE 5 — Double-LSTM  (4 seeds, ~58h each, ~232h total)
+# PHASE 4 — Double-LSTM  (4 seeds, ~58h each, ~232h total)
 # =============================================================================
-sep "PHASE 5/5: Double-LSTM proposed agent (4 seeds, ~232h total)"
-notify "Phase 5/5 START: Double-LSTM" "4 seeds × ~58h each | Est. ~232h (~10 days) | FINAL PHASE" "high" "hourglass_flowing_sand"
+sep "PHASE 4/4: Double-LSTM proposed agent (4 seeds, ~232h total)"
+notify "Phase 4/4 START: Double-LSTM" "4 seeds × ~58h each | Est. ~232h (~10 days) | FINAL PHASE" "high" "hourglass_flowing_sand"
 PHASE4_START=$SECONDS
 
 for i in "${!SEEDS[@]}"; do
@@ -327,8 +283,8 @@ for i in "${!SEEDS[@]}"; do
     fi
 done
 
-notify "Phase 5/5 COMPLETE: Double-LSTM" "All 4 seeds done | Took $(dur $(( SECONDS - PHASE4_START )))" "default" "white_check_mark,tada"
-log "Phase 5 complete in $(dur $(( SECONDS - PHASE4_START )))"
+notify "Phase 4/4 COMPLETE: Double-LSTM" "All 4 seeds done | Took $(dur $(( SECONDS - PHASE4_START )))" "default" "white_check_mark,tada"
+log "Phase 4 complete in $(dur $(( SECONDS - PHASE4_START )))"
 
 # =============================================================================
 sep "ALL EXPERIMENTS COMPLETE"
