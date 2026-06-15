@@ -24,8 +24,10 @@ import pandas as pd
 import seaborn as sns
 
 # ── Reward constants (must match double-lstm_agent.py) ───────────────────────
-L_TARGET          = 0.020
-L_THRESH          = 0.050
+# CSV stores latency in ms (agent multiplies by 1000 before writing),
+# so convert L_TARGET and L_THRESH to ms here.
+L_TARGET          = 20.0    # ms  (0.020 s in agent code)
+L_THRESH          = 50.0    # ms  (0.050 s in agent code)
 NOMINAL_CAP       = 100.0   # req/min per replica at target CPU
 
 BASELINE_WEIGHTS  = {
