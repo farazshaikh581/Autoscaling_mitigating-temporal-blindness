@@ -35,12 +35,10 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 torch.use_deterministic_algorithms(True, warn_only=True)
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
 
-seed = SEED
-# Although several seed values were explored during our experiments, all reported results in the paper correspond to runs with the random seed fixed at 42.
-
-np.random.seed(seed)
-random.seed(seed)
-torch.manual_seed(seed)
+# Default constants — overridden by CLI args in __main__ before any class instantiation.
+SEED = 42
+WINDOW_SIZE = 8          # history steps fed to attention; sensitivity: try 3/10/30
+NOMINAL_CAP_PER_REPLICA = 100  # req/min a single replica handles at target CPU
 
 if torch.cuda.is_available():
     device = torch.device('cuda')
@@ -84,9 +82,11 @@ FEATURE_DIM = 14
 # === CUSTOM NETWORK: ATTENTION + DOUBLE LSTM ===
 # ============================================
 class AttentionDoubleLSTM(BaseFeaturesExtractor):
+    last_attn_weights: list = []  # populated during test for heatmap export
+
     def __init__(self, observation_space, features_dim=256):
         super(AttentionDoubleLSTM, self).__init__(observation_space, features_dim)
-        
+
         self.seq_len = WINDOW_SIZE
         self.input_dim = FEATURE_DIM
         self.hidden_dim = 256  # Match Baseline Paper Capacity
@@ -133,10 +133,13 @@ class AttentionDoubleLSTM(BaseFeaturesExtractor):
         # Attention Pass (Captures Critical Moments)
         attn_scores = self.attn_fc(lstm_out)
         attn_weights = F.softmax(attn_scores, dim=1)
-        
+
+        # Store weights for heatmap export during test (shape: batch x seq_len x 1)
+        AttentionDoubleLSTM.last_attn_weights = attn_weights.detach().cpu().numpy().tolist()
+
         # Context = Weighted sum of history
         context = torch.sum(lstm_out * attn_weights, dim=1)
-        
+
         return self.out_net(context)
 
 # ============================================
@@ -148,7 +151,8 @@ def add_day_column(df, minutes_per_day=MINUTES_PER_DAY):
     df['day'] = (df['minute'] // minutes_per_day).astype(int)
     return df
 
-def get_random_days(df, n_days=7, train_days=5, test_days=2, seed=SEED):
+def get_random_days(df, n_days=7, train_days=5, test_days=2, seed=None):
+    seed = seed if seed is not None else SEED
     all_days = sorted(df.day.unique())
     n_days = min(n_days, len(all_days))
     random.seed(seed)
@@ -173,12 +177,15 @@ def wait_for_service_availability(url, max_retries=5, wait_sec=2):
 # === ENV CLASS ===
 # ============================================
 class MultiAgentClusterEnv(gym.Env):
-    def __init__(self, invocation_file, day_list, service_url):
+    def __init__(self, invocation_file, day_list, service_url, no_aux=False):
         super().__init__()
         self.service_url = service_url
+        self.no_aux = no_aux  # when True: multiplier=1.0, enhancement=0 always (fair HPA comparison)
         self.df = pd.read_csv(invocation_file)
         self.df = add_day_column(self.df)
-        self.action_space = gym.spaces.MultiDiscrete([4, 3, 3, 3])
+        # [HPA target (4), throughput multiplier (3), enhancement (3)]
+        # Dead learning-rate dimension removed (was action[1], never consumed).
+        self.action_space = gym.spaces.MultiDiscrete([4, 3, 3])
         self.day_list = day_list
         self.max_minutes = MINUTES_PER_DAY 
         self.invocation_matrix = self.make_invocation_matrix()
@@ -274,13 +281,10 @@ class MultiAgentClusterEnv(gym.Env):
         # Only truly idle if no requests at all
         if raw_requests < 1.0:
             logging.info(f"Step {self.steps}: Trace=0 | Idle (No requests)")
-            time.sleep(60)  # Add sleep to match StaticHPA timing
+            time.sleep(60)
             self._latency_p90 = 0.005
             self._latency_avg = 0.005
             self._success_ratio = 1.0
-            return 0.0, 0.005, 1.0
-
-            # Return 0 requests, but valid latency/success
             return 0.0, 0.005, 1.0
 
         # ============================================
@@ -426,21 +430,21 @@ class MultiAgentClusterEnv(gym.Env):
     def apply_multiagent_action(self, action):
         opts = [30, 50, 70, 90]
         new_t = opts[int(action[0]) % 4]
-        
+
         if new_t != self.hpa_target:
             self.prev_hpa_target = self.hpa_target
             self.hpa_target = new_t
-            
-            # JSON Patch to update target utilization
             patch = {"spec": {"metrics": [{"type": "Resource","resource": {"name": "cpu","target": {"type": "Utilization","averageUtilization": new_t}}}]}}
-            
             try:
                 subprocess.run(['kubectl', 'patch', 'hpa', application, '-n', app_env, '--patch', json.dumps(patch)], check=True, stdout=subprocess.DEVNULL)
             except subprocess.CalledProcessError:
-                logging.error(f"❌ Failed to patch HPA! Target {new_t}% not applied. Is HPA missing?")
+                logging.error(f"Failed to patch HPA to {new_t}%")
 
-        self.throughput_multiplier = [1.0, 2.0, 3.0][int(action[2]) % 3]
-        self.enhancement = int(action[3]) % 3
+        # action[1] = throughput multiplier, action[2] = enhancement
+        # (dead learning-rate action removed; indices shifted from original)
+        if not self.no_aux:
+            self.throughput_multiplier = [1.0, 2.0, 3.0][int(action[1]) % 3]
+            self.enhancement = int(action[2]) % 3
 
     def step(self, action):
         self.apply_multiagent_action(action)
@@ -576,104 +580,112 @@ if __name__ == "__main__":
     import argparse
     import datetime
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", default="train")
-    parser.add_argument("--url", type=str, required=True, help="Target Service URL")
+    parser = argparse.ArgumentParser(description="Attention Double-LSTM PPO autoscaler")
+    parser.add_argument("--mode",    default="train", choices=["train", "test"])
+    parser.add_argument("--url",     type=str, required=True, help="Service base URL, e.g. http://192.168.122.2:30001/")
+    parser.add_argument("--seed",    type=int, default=42,    help="Random seed (use different values for multi-seed eval)")
+    parser.add_argument("--window",  type=int, default=8,     help="Attention history window size (steps)")
+    parser.add_argument("--no-aux",  action="store_true",     help="Disable throughput multiplier and enhancement (fair HPA comparison)")
+    parser.add_argument("--log-dir", type=str, default=None,  help="Output directory (default: results_log/seed<N>)")
     args = parser.parse_args()
-    
-    current_dir = os.getcwd()
-    
-    # 1. Create Results Directory Explicitly
-    log_dir = "results_log"
+
+    # Override module-level constants before any class is instantiated
+    SEED        = args.seed
+    WINDOW_SIZE = args.window
+
+    # Seed everything now (deferred from module load to here)
+    np.random.seed(SEED)
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    log_dir = args.log_dir or f"results_log/seed{SEED}"
+    if args.no_aux:
+        log_dir = log_dir.rstrip("/") + "_no_aux"
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(f"{log_dir}/tb", exist_ok=True)
 
-    # Generate unique filenames based on time
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     train_csv = f"{log_dir}/train_log_{timestamp}.csv"
-    test_csv = f"{log_dir}/test_log_{timestamp}.csv"
+    test_csv  = f"{log_dir}/test_log_{timestamp}.csv"
+    attn_csv  = f"{log_dir}/attn_weights_{timestamp}.csv"  # attention heatmap data
 
-    # 2. Start Prometheus
     try: start_http_server(9098)
     except: pass
-    
-    # 3. Pre-flight
+
     if not wait_for_service_availability(args.url): sys.exit(1)
 
-    df = pd.read_csv("AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt")
+    trace_file = "AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt"
+    df = pd.read_csv(trace_file)
     df = add_day_column(df)
-    tr_days, te_days = get_random_days(df)
-    
-    def build_env(days): return MultiAgentClusterEnv("AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt", days, service_url=args.url)
-    
-    vec_train = VecNormalize(DummyVecEnv([lambda: build_env(tr_days)]), norm_obs=True, norm_reward=False, clip_obs=10.)
-    
-    # 4. TRAIN MODE
+    tr_days, te_days = get_random_days(df, seed=SEED)
+
+    no_aux = args.no_aux
+    def build_env(days):
+        return MultiAgentClusterEnv(trace_file, days, service_url=args.url, no_aux=no_aux)
+
+    # TRAIN MODE
     if args.mode == "train":
-        logging.info(f"Starting Training... Logging to: {train_csv}")
+        logging.info(f"Training | seed={SEED} window={WINDOW_SIZE} no_aux={no_aux} | log={train_csv}")
         vec_train = VecNormalize(DummyVecEnv([lambda: build_env(tr_days)]), norm_obs=True, norm_reward=False, clip_obs=10.)
 
-
         model = PPO(
-            "MlpPolicy", vec_train, verbose=1, device='cuda',
-            policy_kwargs=dict(features_extractor_class=AttentionDoubleLSTM, features_extractor_kwargs=dict(features_dim=256)),
-            learning_rate=lr_schedule, n_steps=512, n_epochs=10, gae_lambda=0.93, ent_coef=0.01, tensorboard_log=f"{log_dir}/tb"
+            "MlpPolicy", vec_train, verbose=1, device=device,
+            policy_kwargs=dict(features_extractor_class=AttentionDoubleLSTM,
+                               features_extractor_kwargs=dict(features_dim=256)),
+            learning_rate=lr_schedule, n_steps=512, n_epochs=10,
+            gae_lambda=0.93, ent_coef=0.01, tensorboard_log=f"{log_dir}/tb"
         )
-        #reset_timestep = True
-        
+
         cbs = [DetailedLoggingCallback(), TensorboardCallback(train_csv), CheckpointCallback(500, f"{log_dir}/ckpt")]
-        model.learn(total_timesteps=len(tr_days)*MINUTES_PER_DAY, callback=cbs)
-        
+        model.learn(total_timesteps=len(tr_days) * MINUTES_PER_DAY, callback=cbs)
+
         model.save(f"{log_dir}/final_model")
         vec_train.save(f"{log_dir}/vecnorm.pkl")
-        logging.info("Done Training!")
+        logging.info(f"Training complete. Model saved to {log_dir}/")
 
-    # 5. TEST MODE (UPDATED)
+    # TEST MODE
     if args.mode == "test":
-        logging.info(f"Starting Testing... Logging to: {test_csv}")
-        
-        # Verify files exist
+        logging.info(f"Testing | seed={SEED} window={WINDOW_SIZE} no_aux={no_aux} | log={test_csv}")
+
         model_path = f"{log_dir}/final_model.zip"
-        norm_path = f"{log_dir}/vecnorm.pkl"
-        
+        norm_path  = f"{log_dir}/vecnorm.pkl"
         if not os.path.exists(model_path) or not os.path.exists(norm_path):
-            logging.error(f"❌ Missing model or norm file in {log_dir}/"); sys.exit(1)
-            
-        # Load Env & Model
+            logging.error(f"Missing model or vecnorm in {log_dir}/"); sys.exit(1)
+
         vec_test = VecNormalize.load(norm_path, DummyVecEnv([lambda: build_env(te_days)]))
         vec_test.training = False; vec_test.norm_reward = False
         model = PPO.load(model_path, device=device)
-        #model = PPO.load(f"{log_dir}/ckpt_attn/PPO_2500_steps.zip")
         model.set_env(vec_test)
 
-        tmp_path = "tmp/sb3_log/"
-        new_logger = configure(tmp_path, ["stdout", "csv"])
+        new_logger = configure(f"{log_dir}/sb3_log/", ["stdout", "csv"])
         model.set_logger(new_logger)
-        
-        # Setup Callback for Logging
+
         test_cb = TensorboardCallback(test_csv)
-        test_cb.manual_env = vec_test
         test_cb.init_callback(model)
-        
+
+        # Attention weight CSV header (one row per test step, WINDOW_SIZE weight columns)
+        with open(attn_csv, 'w', newline='') as af:
+            csv.writer(af).writerow(["step"] + [f"w_t{i}" for i in range(WINDOW_SIZE)])
+
         obs = vec_test.reset()
         total_steps = len(te_days) * MINUTES_PER_DAY
-        
-        logging.info(f"Running evaluation for {total_steps} steps...")
-        
+
         for i in range(total_steps):
             action, _ = model.predict(obs, deterministic=True)
             obs, reward, done, info = vec_test.step(action)
-            
-            # MANUAL LOGGING TRIGGER
-            # We inject the test env into the callback so it reads the correct metrics
-            test_cb.manual_env = vec_test
-            test_cb.init_callback(model)
+
             test_cb.num_timesteps = i
             test_cb._on_step()
-            
+
+            # Export attention weights (first batch element, squeeze last dim)
+            if AttentionDoubleLSTM.last_attn_weights:
+                w = AttentionDoubleLSTM.last_attn_weights[0]  # shape: [seq_len, 1]
+                row = [i] + [float(x[0]) for x in w]
+                with open(attn_csv, 'a', newline='') as af:
+                    csv.writer(af).writerow(row)
+
             if i % 10 == 0:
-                # Access raw env to print real latency (not normalized)
                 raw_env = vec_test.unwrapped.envs[0]
                 logging.info(f"Test Step {i}: Reward={float(reward[0]):.2f} | Latency={raw_env._latency_p90*1000:.1f}ms")
-                
-        logging.info(f"✅ Testing Complete! Data saved to {test_csv}")
+
+        logging.info(f"Testing complete. Results: {test_csv} | Attention: {attn_csv}")

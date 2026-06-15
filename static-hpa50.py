@@ -195,7 +195,7 @@ class StaticBenchmark:
         subprocess.run(['kubectl', 'delete', 'hpa', application, '-n', app_env], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(2)
         # 3. Create Static HPA (Target 50%, Min 1, Max 30)
-        subprocess.run(['kubectl', 'autoscale', 'deploy', application, '-n', app_env, '--cpu-percent=50', '--min=1', '--max=30'], stdout=subprocess.DEVNULL)
+        subprocess.run(['kubectl', 'autoscale', 'deploy', application, '-n', app_env, '--cpu-percent=50', '--min=1', '--max=200'], stdout=subprocess.DEVNULL)
         logging.info("✅ Static HPA (50%) Applied.")
         time.sleep(10)
 
@@ -240,30 +240,28 @@ class StaticBenchmark:
 # ============================================
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--url", type=str, required=True, help="Target Service URL")
+    parser = argparse.ArgumentParser(description="Static HPA 50% benchmark")
+    parser.add_argument("--url",     type=str, required=True, help="Target Service URL")
+    parser.add_argument("--seed",    type=int, default=42,    help="Random seed (controls test day selection)")
+    parser.add_argument("--log-dir", type=str, default=None,  help="Output directory (default: results/static_hpa/seed<N>)")
     args = parser.parse_args()
-    
-    current_dir = os.getcwd()
-    
-    # Setup Directory
-    log_dir = "results_log"
+
+    SEED = args.seed
+    np.random.seed(SEED)
+    random.seed(SEED)
+
+    log_dir = args.log_dir or f"results/static_hpa/seed{SEED}"
     os.makedirs(log_dir, exist_ok=True)
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    csv_file = f"{log_dir}/test-StaticHPA50_CORRECTED_{timestamp}.csv"
-    
+    csv_file = f"{log_dir}/test_log_{timestamp}.csv"
+
     if not wait_for_service_availability(args.url): sys.exit(1)
 
-    # Load Data
     df = pd.read_csv("AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt")
     df = add_day_column(df)
-    
-    # === CRITICAL: Get same days as PPO ===
     _, test_days = get_random_days(df, seed=SEED)
-    logging.info(f"📅 SELECTED TEST DAYS: {test_days}")
-    
-    # Run Benchmark
+    logging.info(f"Seed={SEED} | Test days: {test_days} | Log: {csv_file}")
+
     benchmark = StaticBenchmark("AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt", test_days, args.url, csv_file)
     benchmark.run_loop()
-    
-    logging.info(f"✅ Benchmark Complete. Results: {csv_file}")
+    logging.info(f"Static HPA benchmark complete. Results: {csv_file}")

@@ -32,13 +32,9 @@ logging.getLogger("requests").setLevel(logging.WARNING)
 
 torch.use_deterministic_algorithms(True, warn_only=True)
 os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-# add seed
-seed = SEED
-# Although several seed values were explored during our experiments, all reported results in the paper correspond to runs with the random seed fixed at 42.
 
-np.random.seed(seed)
-random.seed(seed)
-torch.manual_seed(seed)
+# Default — overridden by --seed CLI arg in __main__
+SEED = 42
 
 if torch.cuda.is_available():
     device = torch.device('cuda')
@@ -75,7 +71,8 @@ def add_day_column(df, minutes_per_day=MINUTES_PER_DAY):
     df['day'] = (df['minute'] // minutes_per_day).astype(int)
     return df
 
-def get_random_days(df, n_days=7, train_days=5, test_days=2, seed=SEED):
+def get_random_days(df, n_days=7, train_days=5, test_days=2, seed=None):
+    seed = seed if seed is not None else SEED
     all_days = sorted(df.day.unique())
     n_days = min(n_days, len(all_days))
     random.seed(seed)
@@ -105,7 +102,8 @@ class MultiAgentClusterEnv(gym.Env):
         self.service_url = service_url
         self.df = pd.read_csv(invocation_file)
         self.df = add_day_column(self.df)
-        self.action_space = gym.spaces.MultiDiscrete([4, 3, 3, 3])
+        # Dead learning-rate dimension removed; action[1]=throughput, action[2]=enhancement
+        self.action_space = gym.spaces.MultiDiscrete([4, 3, 3])
         
         self.day_list = day_list
         self.max_minutes = MINUTES_PER_DAY 
@@ -303,8 +301,8 @@ class MultiAgentClusterEnv(gym.Env):
             patch = {"spec": {"metrics": [{"type": "Resource","resource": {"name": "cpu","target": {"type": "Utilization","averageUtilization": new_t}}}]}}
             try: subprocess.run(['kubectl', 'patch', 'hpa', application, '-n', app_env, '--patch', json.dumps(patch)], stdout=subprocess.DEVNULL)
             except: pass
-        self.throughput_multiplier = [1.0, 2.0, 3.0][int(action[2]) % 3]
-        self.enhancement = int(action[3]) % 3
+        self.throughput_multiplier = [1.0, 2.0, 3.0][int(action[1]) % 3]
+        self.enhancement = int(action[2]) % 3
 
     def step(self, action):
         self.apply_multiagent_action(action)
@@ -434,7 +432,8 @@ class TensorboardCallback(BaseCallback):
                 f.flush(); os.fsync(f.fileno())
         return True
 
-lr_schedule = lambda p: cosine_schedule(p, lr_start=2e-4, lr_end=0.0)
+def lr_schedule(progress):
+    return 2e-4 * 0.5 * (1 + np.cos(np.pi * (1 - progress)))
 
 # ============================================
 # === MAIN ===
@@ -442,90 +441,89 @@ lr_schedule = lambda p: cosine_schedule(p, lr_start=2e-4, lr_end=0.0)
 if __name__ == "__main__":
     import argparse
     import datetime
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", default="train")
-    parser.add_argument("--url", type=str, required=True, help="Target Service URL")
+
+    parser = argparse.ArgumentParser(description="Single-LSTM RecurrentPPO autoscaler (ablation baseline)")
+    parser.add_argument("--mode",    default="train", choices=["train", "test"])
+    parser.add_argument("--url",     type=str, required=True, help="Service base URL")
+    parser.add_argument("--seed",    type=int, default=42,   help="Random seed")
+    parser.add_argument("--log-dir", type=str, default=None, help="Output directory (default: results_log_baseline/seed<N>)")
     args = parser.parse_args()
-    
-    current_dir = os.getcwd()
-    
-    # 1. Create Results Directory
-    log_dir = "results_log"
+
+    SEED = args.seed
+    np.random.seed(SEED)
+    random.seed(SEED)
+    torch.manual_seed(SEED)
+
+    log_dir = args.log_dir or f"results_log_baseline/seed{SEED}"
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(f"{log_dir}/tb", exist_ok=True)
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     train_csv = f"{log_dir}/train_log_{timestamp}.csv"
-    test_csv = f"{log_dir}/test_log_{timestamp}.csv"
+    test_csv  = f"{log_dir}/test_log_{timestamp}.csv"
 
-    # 2. Start Prometheus (Port 9091)
-    try: start_http_server(9091) 
+    try: start_http_server(9091)
     except: pass
-    
-    # 3. Pre-flight
+
     if not wait_for_service_availability(args.url): sys.exit(1)
 
-    df = pd.read_csv("AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt")
+    trace_file = "AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt"
+    df = pd.read_csv(trace_file)
     df = add_day_column(df)
-    tr_days, te_days = get_random_days(df)
-    
-    def build_env(days): return MultiAgentClusterEnv("AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt", days, service_url=args.url)
-    
-    vec_train = VecNormalize(DummyVecEnv([lambda: build_env(tr_days)]), norm_obs=True, norm_reward=False, clip_obs=10.)
-    
+    tr_days, te_days = get_random_days(df, seed=SEED)
+
+    def build_env(days):
+        return MultiAgentClusterEnv(trace_file, days, service_url=args.url)
+
     if args.mode == "train":
-        logging.info("Starting Baseline LSTM Training...")
-        logging.info(f"📊 Logging to: {train_csv}")
-        
+        logging.info(f"Training Single-LSTM | seed={SEED} | log={train_csv}")
+        vec_train = VecNormalize(DummyVecEnv([lambda: build_env(tr_days)]), norm_obs=True, norm_reward=False, clip_obs=10.)
+
         model = RecurrentPPO(
-            "MlpLstmPolicy", 
-            vec_train,
+            "MlpLstmPolicy", vec_train,
             n_steps=128, batch_size=128,
             gamma=0.99, gae_lambda=0.95,
-            learning_rate=lr_schedule, 
+            learning_rate=lr_schedule,
             policy_kwargs={
-                'n_lstm_layers': 1,          # Single Layer
-                'lstm_hidden_size': 256,     # 256 Units
-                'net_arch': dict(pi=[64, 64], vf=[64, 64]) # 2x64 MLP
-            }, 
-            verbose=1, tensorboard_log=f"{log_dir}/tb", n_epochs=10, device='cuda'
+                'n_lstm_layers': 1,
+                'lstm_hidden_size': 256,
+                'net_arch': dict(pi=[64, 64], vf=[64, 64])
+            },
+            verbose=1, tensorboard_log=f"{log_dir}/tb", n_epochs=10, device=device
         )
-        
-        cbs = [
-            DetailedLoggingCallback(), 
-            TensorboardCallback(train_csv), 
-            CheckpointCallback(500, f"{log_dir}/ckpt_baseline")
-        ]
-        model.learn(total_timesteps=len(tr_days)*MINUTES_PER_DAY, callback=cbs)
-        
+
+        cbs = [DetailedLoggingCallback(), TensorboardCallback(train_csv), CheckpointCallback(500, f"{log_dir}/ckpt_baseline")]
+        model.learn(total_timesteps=len(tr_days) * MINUTES_PER_DAY, callback=cbs)
+
         model.save(f"{log_dir}/final_model_baseline")
         vec_train.save(f"{log_dir}/vecnorm_baseline.pkl")
-        logging.info("Done Training!")
+        logging.info(f"Training complete. Model saved to {log_dir}/")
 
     if args.mode == "test":
-        logging.info("Starting Testing...")
-        if not os.path.exists(f"{log_dir}/final_model_baseline.zip"): sys.exit(1)
-            
-        vec_test = VecNormalize.load(f"{log_dir}/vecnorm_baseline.pkl", DummyVecEnv([lambda: build_env(te_days)]))
+        logging.info(f"Testing Single-LSTM | seed={SEED} | log={test_csv}")
+        model_path = f"{log_dir}/final_model_baseline.zip"
+        norm_path  = f"{log_dir}/vecnorm_baseline.pkl"
+        if not os.path.exists(model_path): logging.error(f"Missing {model_path}"); sys.exit(1)
+
+        vec_test = VecNormalize.load(norm_path, DummyVecEnv([lambda: build_env(te_days)]))
         vec_test.training = False; vec_test.norm_reward = False
-        model = RecurrentPPO.load(f"{log_dir}/final_model_baseline")
-        
+        model = RecurrentPPO.load(model_path, device=device)
+
         test_cb = TensorboardCallback(test_csv)
-        test_cb.manual_env = vec_test
+        test_cb.init_callback(model)
+
         obs = vec_test.reset()
-        lstm_states = None
+        lstm_states    = None
         episode_starts = np.ones((1,), dtype=bool)
-        total_steps = len(te_days) * MINUTES_PER_DAY
-        
+        total_steps    = len(te_days) * MINUTES_PER_DAY
+
         for i in range(total_steps):
             action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=True)
             obs, reward, done, info = vec_test.step(action)
             episode_starts = done
-
             test_cb.num_timesteps = i
             test_cb._on_step()
-            
-            #test_cb.training_env = vec_test; test_cb.num_timesteps = i; test_cb._on_step()
-            if i % 10 == 0: logging.info(f"Test Step {i}: Reward={float(reward[0]):.2f}")
-        logging.info("Done Testing!")
+            if i % 10 == 0:
+                logging.info(f"Test Step {i}: Reward={float(reward[0]):.2f}")
+
+        logging.info(f"Testing complete. Results: {test_csv}")

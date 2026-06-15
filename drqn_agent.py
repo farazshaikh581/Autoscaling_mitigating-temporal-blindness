@@ -1,13 +1,24 @@
 # -*- coding: utf-8 -*-
-# === DOUBLE DQN BASELINE ===
-# Off-policy value-based RL baseline (no forecast, 13-dim state).
-# Runs in train or test mode; supports --seed, --log-dir, --no-aux.
+# === DRQN BASELINE (Deep Recurrent Q-Network) ===
+# Extends DDQN by replacing the MLP Q-network with an LSTM-based feature
+# extractor, allowing the agent to maintain temporal context across steps.
+# Uses the zero-start strategy during training (Hausknecht & Stone 2015, §4.1):
+# hidden state is initialised to zero at the start of each mini-batch.
+# During inference the hidden state is carried between steps and reset only
+# at episode boundaries, enabling true recurrent decision-making.
+#
+# Architecture:
+#   DDQN: obs(13) → MLP[64,64] → Q(36)
+#   DRQN: obs(13) → LSTM(128)  → MLP[64] → Q(36)
 
-import os, sys, math, torch, numpy as np, pandas as pd
+import os, sys, math, torch, torch.nn as nn
+import numpy as np, pandas as pd
 import subprocess, random, re, json, logging, time, warnings, csv, requests
 import datetime, argparse
+import torch as th
 
 from stable_baselines3 import DQN
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback
 
@@ -25,8 +36,48 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 logging.info(f"Device: {device}")
 
 # ============================================================
+# DRQN FEATURE EXTRACTOR
+# ============================================================
+class DrqnExtractor(BaseFeaturesExtractor):
+    """Single-layer LSTM feature extractor for DRQN.
+
+    Training: zero-start (hidden state = 0 for every mini-batch sample).
+    Inference: hidden state carried between steps; reset at episode boundaries
+               by calling reset_hidden() from the test loop.
+    """
+    def __init__(self, observation_space, features_dim: int = 128):
+        super().__init__(observation_space, features_dim)
+        n_obs = int(np.prod(observation_space.shape))
+        self.lstm = nn.LSTM(n_obs, features_dim, num_layers=1, batch_first=True)
+        # Inference-time state (None = not yet initialised)
+        self._h: th.Tensor | None = None
+        self._c: th.Tensor | None = None
+
+    def reset_hidden(self, device=None):
+        """Call at the start of each evaluation episode."""
+        dev = device or next(self.parameters()).device
+        self._h = th.zeros(1, 1, self.features_dim, device=dev)
+        self._c = th.zeros(1, 1, self.features_dim, device=dev)
+
+    def forward(self, obs: th.Tensor) -> th.Tensor:
+        x = obs.unsqueeze(1)   # (batch, 1, n_obs)
+        batch = obs.shape[0]
+
+        if batch == 1 and self._h is not None:
+            # Inference path: carry state across steps
+            out, (self._h, self._c) = self.lstm(x, (self._h, self._c))
+        else:
+            # Training path: zero-start (standard DRQN approximation)
+            out, _ = self.lstm(x)
+
+        return out.squeeze(1)  # (batch, features_dim)
+
+
+# ============================================================
 # UTILS
 # ============================================================
+import gymnasium as gym
+
 def add_day_column(df, minutes_per_day=MINUTES_PER_DAY):
     t0 = df.end_timestamp.min()
     df['minute'] = (df.end_timestamp - t0) // 60
@@ -53,11 +104,9 @@ def wait_for_service(url, max_retries=5):
     return False
 
 # ============================================================
-# ENVIRONMENT
+# ENVIRONMENT  (identical to ddqn_agent — same action/obs/reward)
 # ============================================================
-import gymnasium as gym
-
-class DQNClusterEnv(gym.Env):
+class DRQNClusterEnv(gym.Env):
     def __init__(self, invocation_file, day_list, service_url, no_aux=False):
         super().__init__()
         self.service_url = service_url
@@ -66,8 +115,7 @@ class DQNClusterEnv(gym.Env):
         self.df = add_day_column(self.df)
         self.day_list = day_list
 
-        # [4 HPA targets] x [3 throughput multipliers] x [3 enhancement levels] = 36
-        # Dead learning-rate action removed (was action[1] in original [4,3,3,3] encoding).
+        # [4 HPA targets] × [3 throughput] × [3 enhancement] = 36
         self.action_space = gym.spaces.Discrete(4 * 3 * 3)
 
         self.invocation_matrix = self._make_matrix()
@@ -81,7 +129,7 @@ class DQNClusterEnv(gym.Env):
         self.reward = 0.0
         self._latency_p90 = 0.05; self._latency_avg = 0.05; self._success_ratio = 1.0
 
-        # 13-dim state (no forecast signal — ablation vs Double-LSTM's 14-dim)
+        # 13-dim state (no forecast — same as DDQN for direct comparison)
         low  = np.array([0.001, 1,   0,   0,   0,    0,    0,    0, 1,  1.0, 0, -1, -1], dtype=np.float32)
         high = np.array([0.150, 200, 200, 100, 3600, 1800, 1800, 1, 95, 3.0, 2,  1,  1], dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
@@ -99,12 +147,8 @@ class DQNClusterEnv(gym.Env):
         return matrix
 
     def decode_action(self, a: int):
-        # Decode flat index → [hpa_idx, throughput_idx, enhancement_idx]
         a = int(a) % 36
-        a0 = a // 9        # HPA target:  0–3
-        a1 = (a % 9) // 3  # Throughput:  0–2
-        a2 = a % 3         # Enhancement: 0–2
-        return a0, a1, a2
+        return a // 9, (a % 9) // 3, a % 3   # hpa_idx, throughput_idx, enhancement_idx
 
     def apply_action(self, a0, a1, a2):
         new_t = [30, 50, 70, 90][a0]
@@ -119,7 +163,6 @@ class DQNClusterEnv(gym.Env):
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
-
         if not self.no_aux:
             self.throughput_multiplier = [1.0, 2.0, 3.0][a1]
             self.enhancement = a2
@@ -131,7 +174,6 @@ class DQNClusterEnv(gym.Env):
             time.sleep(60)
             self._latency_p90 = 0.005; self._latency_avg = 0.005; self._success_ratio = 1.0
             return 0.0
-
         target_qps = (raw_req * self.throughput_multiplier) / 60.0
         concurrency = max(1, min(int(raw_req / 10), 10))
         cmd = (f'hey -c {concurrency} -q {max(0.001, target_qps):.4f} -z 60s -m GET '
@@ -144,7 +186,6 @@ class DQNClusterEnv(gym.Env):
             logging.error(f"hey error: {e}")
             self._latency_p90 = 1.0; self._latency_avg = 1.0; self._success_ratio = 0.0
             return raw_req
-
         p90 = re.search(r"90%\s+in\s+([\d.]+)\s+secs", output)
         avg = re.search(r"Average:\s+([\d.]+)\s+secs", output)
         self._latency_p90 = float(p90.group(1)) if p90 else 0.05
@@ -189,7 +230,6 @@ class DQNClusterEnv(gym.Env):
         reps = int(self.state[1])
         cpu = float(self.state[2])
         succ = self._success_ratio
-
         r_slo = (1.0 if lat <= 0.020 else
                  0.5 + 0.5 * (0.050 - lat) / 0.030 if lat <= 0.050 else
                  max(-1.0, -0.5 * (lat - 0.050) / 0.1))
@@ -198,11 +238,7 @@ class DQNClusterEnv(gym.Env):
         delta = abs(reps - self.last_replicas)
         r_stab = -0.1 * delta if delta <= 2 else -0.5 * delta
         r_succ = 1.0 if succ >= 0.99 else float(np.log(max(succ, 1e-6)))
-
-        # Same weights as Double-LSTM (no forecast term — w_fcst redistributed)
-        reward = 0.50 * r_slo + 0.25 * r_cpu + 0.12 * r_succ + 0.08 * r_stab + \
-                 0.05 * r_slo  # substitute forecast weight with extra SLO signal
-        self.reward = float(reward)
+        self.reward = 0.55 * r_slo + 0.25 * r_cpu + 0.12 * r_succ + 0.08 * r_stab
         self.last_replicas = reps
         return self.reward
 
@@ -211,11 +247,9 @@ class DQNClusterEnv(gym.Env):
         self.apply_action(a0, a1, a2)
         reqs = self._run_hey()
         raw = self._get_state(reqs)
-        low = self.observation_space.low; high = self.observation_space.high
-        self.state = np.clip(raw, low, high)
+        self.state = np.clip(raw, self.observation_space.low, self.observation_space.high)
         reward = self._compute_reward()
-        self.steps += 1
-        self.global_step += 1
+        self.steps += 1; self.global_step += 1
         if self.steps >= MINUTES_PER_DAY:
             self.days += 1; self.steps = 0
         done = self.global_step >= self.days_train * MINUTES_PER_DAY
@@ -271,20 +305,19 @@ class CSVCallback(BaseCallback):
 # MAIN
 # ============================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Double DQN baseline for Kubernetes autoscaling")
+    parser = argparse.ArgumentParser(description="DRQN baseline — LSTM Q-network for partial observability")
     parser.add_argument("--mode",    default="train", choices=["train", "test"])
     parser.add_argument("--url",     type=str, required=True)
     parser.add_argument("--seed",    type=int, default=42)
-    parser.add_argument("--log-dir", type=str, default="results_log_ddqn")
-    parser.add_argument("--no-aux",  action="store_true",
-                        help="Fix throughput multiplier=1.0 and enhancement=0 (fair HPA comparison)")
+    parser.add_argument("--log-dir", type=str, default=None)
+    parser.add_argument("--no-aux",  action="store_true")
     args = parser.parse_args()
 
     SEED = args.seed
     np.random.seed(SEED); random.seed(SEED); torch.manual_seed(SEED)
 
     suffix = "_no_aux" if args.no_aux else ""
-    log_dir = os.path.join(args.log_dir, f"seed{SEED}{suffix}")
+    log_dir = args.log_dir or f"results/drqn/seed{SEED}{suffix}"
     os.makedirs(log_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -295,52 +328,64 @@ if __name__ == "__main__":
     df = add_day_column(df)
     tr_days, te_days = get_random_days(df, seed=SEED)
 
+    # DRQN policy kwargs: LSTM feature extractor + small MLP head
+    policy_kwargs = dict(
+        features_extractor_class=DrqnExtractor,
+        features_extractor_kwargs=dict(features_dim=128),
+        net_arch=[64],          # MLP head after LSTM
+    )
+
     if args.mode == "train":
-        logging.info(f"Starting Double DQN training | seed={SEED} | log={log_dir}")
-        env = DummyVecEnv([lambda: DQNClusterEnv(
+        logging.info(f"DRQN training | seed={SEED} | log={log_dir}")
+        env = DummyVecEnv([lambda: DRQNClusterEnv(
             "AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt",
             tr_days, args.url, no_aux=args.no_aux)])
         env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
-        total_steps = len(tr_days) * MINUTES_PER_DAY   # 5 × 500 = 2500
+        total_steps = len(tr_days) * MINUTES_PER_DAY
 
         model = DQN(
             "MlpPolicy", env,
+            policy_kwargs=policy_kwargs,
             verbose=1,
             learning_rate=1e-4,
             gamma=0.99,
-            buffer_size=min(total_steps, 5000),   # right-sized for available data
+            buffer_size=min(total_steps, 5000),
             batch_size=32,
-            learning_starts=50,                   # begin after 50 warm-up steps
-            train_freq=1,                         # update every step (max use of data)
+            learning_starts=50,
+            train_freq=1,
             gradient_steps=1,
-            target_update_interval=500,           # update target network ~5× during training
-            exploration_fraction=0.4,             # explore 40% of training (1000 steps)
+            target_update_interval=500,
+            exploration_fraction=0.4,
             exploration_final_eps=0.05,
             optimize_memory_usage=False,
             tensorboard_log=os.path.join(log_dir, "tb"),
             device=device,
         )
-        cb = CSVCallback(os.path.join(log_dir, f"ddqn_train_{ts}.csv"))
+        cb = CSVCallback(os.path.join(log_dir, f"drqn_train_{ts}.csv"))
         model.learn(total_timesteps=total_steps, callback=cb)
-        model.save(os.path.join(log_dir, "ddqn_model"))
+        model.save(os.path.join(log_dir, "drqn_model"))
         env.save(os.path.join(log_dir, "vecnorm.pkl"))
-        logging.info("Double DQN training complete.")
+        logging.info("DRQN training complete.")
 
     elif args.mode == "test":
-        logging.info(f"Starting Double DQN evaluation | seed={SEED} | log={log_dir}")
-        env = DummyVecEnv([lambda: DQNClusterEnv(
+        logging.info(f"DRQN evaluation | seed={SEED} | log={log_dir}")
+        env = DummyVecEnv([lambda: DRQNClusterEnv(
             "AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt",
             te_days, args.url, no_aux=args.no_aux)])
         vn_path = os.path.join(log_dir, "vecnorm.pkl")
         if os.path.exists(vn_path):
             env = VecNormalize.load(vn_path, env)
             env.training = False; env.norm_reward = False
-        model = DQN.load(os.path.join(log_dir, "ddqn_model"), env=env, device=device)
+        model = DQN.load(os.path.join(log_dir, "drqn_model"), env=env, device=device)
+
+        # Reset LSTM hidden state at episode start
+        extractor = model.policy.features_extractor
+        extractor.reset_hidden(device=device)
 
         headers = ["Step", "Reward", "Latency_P90", "Latency_Avg",
                    "Replicas", "CPU_Pct", "Requests", "Success"]
-        out_csv = os.path.join(log_dir, f"ddqn_test_{ts}.csv")
+        out_csv = os.path.join(log_dir, f"drqn_test_{ts}.csv")
         with open(out_csv, 'w', newline='') as f:
             csv.DictWriter(f, fieldnames=headers).writeheader()
 
@@ -362,7 +407,9 @@ if __name__ == "__main__":
                     "Requests": float(s[4]),
                     "Success": float(raw_env._success_ratio),
                 })
+            if done:
+                extractor.reset_hidden(device=device)   # reset LSTM at episode boundary
             if i % 10 == 0:
                 logging.info(f"Step {i}: Reps={int(s[1])} | Lat={raw_env._latency_p90*1000:.1f}ms | "
                              f"Succ={raw_env._success_ratio:.3f}")
-        logging.info(f"Double DQN evaluation complete. Results: {out_csv}")
+        logging.info(f"DRQN evaluation complete. Results: {out_csv}")
