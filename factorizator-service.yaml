@@ -9,6 +9,6 @@ spec:
     app: factorizator
   ports:
   - name: http
-    port: 8080
-    targetPort: 8080
-    nodePort: 31401
+    port: port
+    targetPort: targetport
+    nodePort: nodeport
