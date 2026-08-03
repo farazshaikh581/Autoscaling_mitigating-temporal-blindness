@@ -30,3 +30,7 @@ tmp/
 # OS
 .DS_Store
 Thumbs.db
+
+# Reviewer correspondence (kept private, outside version control)
+response_*.md
+rebuttal*.md
