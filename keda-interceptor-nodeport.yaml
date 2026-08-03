@@ -1,0 +1,19 @@
+# Expose the KEDA HTTP add-on interceptor as a NodePort so hey can reach it
+# from outside the cluster. Traffic flows:
+#   hey -> NodePort 30002 -> interceptor-proxy -> factorizator-service -> pods
+# The interceptor counts pending requests and signals KEDA to scale.
+apiVersion: v1
+kind: Service
+metadata:
+  name: keda-interceptor-nodeport
+  namespace: keda
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/component: interceptor
+    app.kubernetes.io/name: http-add-on
+  ports:
+    - name: proxy
+      port: 8080
+      targetPort: proxy
+      nodePort: 30002

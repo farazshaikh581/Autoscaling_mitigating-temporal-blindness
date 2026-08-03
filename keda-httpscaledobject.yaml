@@ -1,0 +1,36 @@
+# HTTPScaledObject for the factorizator deployment. KEDA HTTP add-on routes
+# traffic from the interceptor to factorizator-service and scales based on
+# request rate.
+#
+# keda_baseline.py overrides granularity/targetValue at apply time via
+# --target-rpm; the values below are just the fallback if applied directly.
+#
+# Delete the native HPA before applying this (KEDA manages its own):
+#   microk8s kubectl delete hpa factorizator -n factorizator
+#
+# Traffic goes to the interceptor (NodePort 30002) with the Host header:
+#   hey -H "Host: factorizator.local" http://<cluster-ip>:30002/factor?n=...
+apiVersion: http.keda.sh/v1alpha1
+kind: HTTPScaledObject
+metadata:
+  name: factorizator-keda
+  namespace: factorizator
+spec:
+  hosts:
+    - factorizator.local
+  pathPrefixes:
+    - /
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: factorizator
+    service: factorizator-service
+    port: 80
+  replicas:
+    min: 1
+    max: 100
+  scalingMetric:
+    requestRate:
+      granularity: 1s
+      targetValue: 1        # 1 req/s per replica; tune here if scaling is too slow
+      window: 1m

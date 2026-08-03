@@ -8,7 +8,7 @@
 # no_aux:  0 (default) | 1 — disable throughput multiplier/enhancement (fair HPA comparison)
 
 AGENT=${1:-double-lstm}
-URL=${2:-http://192.168.122.2:30001/}
+URL=${2:?usage: launch_experiment.sh <agent> <service-url> [mode] [seed] [window] [no_aux]}
 MODE=${3:-train}
 SEED=${4:-42}
 WINDOW=${5:-8}

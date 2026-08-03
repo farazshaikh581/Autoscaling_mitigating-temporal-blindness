@@ -53,6 +53,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
+import glob
 from prometheus_client import start_http_server
 
 # CONSTANTS
@@ -159,11 +160,11 @@ def get_random_days(df, n_days=7, train_days=5, test_days=2, seed=None):
     selected_days = random.sample(list(all_days), n_days)
     return selected_days[:train_days], selected_days[train_days:train_days+test_days]
 
-def wait_for_service_availability(url, max_retries=5, wait_sec=2):
+def wait_for_service_availability(url, max_retries=20, wait_sec=3):
     logging.info(f"🔍 PRE-FLIGHT CHECK: Testing connection to {url}...")
     for i in range(max_retries):
         try:
-            response = requests.get(f"{url}factor?n=1", timeout=2)
+            response = requests.get(f"{url}factor?n=1", timeout=8)
             if response.status_code == 200:
                 logging.info(f"✅ Service is UP. (Attempt {i+1}/{max_retries})")
                 return True
@@ -194,6 +195,8 @@ class MultiAgentClusterEnv(gym.Env):
         self.steps = 0; self.days = 0; self.global_step = 0
         self.hpa_target = cpu_target_percentage
         self.prev_hpa_target = cpu_target_percentage
+        self.pending_hpa_target = cpu_target_percentage
+        self.pending_hpa_count = 0
         self.throughput_multiplier = 1.0; self.enhancement = 0
         self.reward = 0.0; self.raw_request_history = deque(maxlen=FORECAST_WINDOW)
         self.current_step_reward = 0.0; self.last_replicas = 1
@@ -201,8 +204,11 @@ class MultiAgentClusterEnv(gym.Env):
         self.forecast_running_avg = 100.0
         
         # Bounds
+        # Latency high bound widened 0.15->3.0s: at 0.15 the observed value saturated for any
+        # overload past 150ms, hiding true severity from the policy while the reward (which
+        # uses the unclipped value) kept scoring proportionally worse.
         self.low_base = np.array([0.001, 1, 0, 0, 0, 0, 0, 0, 1, 1.0, 0, -1, -1, 0], dtype=np.float32)
-        self.high_base = np.array([0.15, 200.0, 200.0, 100, 3600, 1800, 1800, 1, 95, 3.0, 2, 1, 1, 3600], dtype=np.float32)
+        self.high_base = np.array([3.0, 200.0, 200.0, 100, 3600, 1800, 1800, 1, 95, 3.0, 2, 1, 1, 3600], dtype=np.float32)
         
         # Observation Space (Flattened Window)
         self.observation_space = gym.spaces.Box(
@@ -305,16 +311,23 @@ class MultiAgentClusterEnv(gym.Env):
 
 
         target_qps = (raw_requests * self.throughput_multiplier) / 60.0
-        
+        # hey's -q is QPS PER WORKER, not aggregate. Passing target_qps (the intended
+        # aggregate rate) directly here was delivering ~concurrency-fold too much real load.
+        q_per_worker = target_qps / concurrency
+
         # 3. Workload (Raw 'n')
         #work_param = 1000000007000000009  # Hard semiprime
         work_param = 1000000016000000063
 
         # Command Construction
-        # -c 1 : Single Connection
-        # -q : Force specific requests per second
+        # -q : per-worker rate (aggregate = q_per_worker * concurrency == target_qps)
+        # -disable-keepalive: without it, hey reuses up to `concurrency` persistent connections
+        # for the whole 60s burst, each pinned by kube-proxy to one backend pod — so at most
+        # `concurrency` (<=10) replicas ever receive traffic in a step regardless of how many
+        # total replicas exist. Forcing a fresh connection per request lets the Service
+        # actually load-balance across all ready replicas.
         # -z 60s : Run for the full minute
-        command = f"hey -c {concurrency} -q {max(0.001, target_qps):.4f} -z 60s -m GET {self.service_url}factor?n={work_param}"
+        command = f"hey -c {concurrency} -q {max(0.001, q_per_worker):.4f} -disable-keepalive -z 60s -m GET {self.service_url}factor?n={work_param}"
         #command = f"hey -c {concurrency} -q {max(0.001, target_qps):.4f} -z 60s -m GET {self.service_url}factor?n={int(work_param)}"
         #command = f"hey -c {concurrency} -z 60s -m GET {self.service_url}factor?n={work_param}"
         logging.info(f"Step {self.steps}: Trace={raw_requests:.0f} | Workers={concurrency} | QPS={target_qps:.2f}")
@@ -427,18 +440,30 @@ class MultiAgentClusterEnv(gym.Env):
         return float(reward)
 
     
+    # Number of consecutive steps the same HPA target must be requested before it's actually
+    # applied. Without this, an unstable policy can flip the live HPA target almost every step,
+    # each flip forcing a kubectl patch and churning pods (create/terminate) continuously —
+    # decoupled from real CPU capacity but very visible as sustained inflated request latency.
+    HPA_DEBOUNCE_STEPS = 3
+
     def apply_multiagent_action(self, action):
         opts = [30, 50, 70, 90]
-        new_t = opts[int(action[0]) % 4]
+        requested_t = opts[int(action[0]) % 4]
 
-        if new_t != self.hpa_target:
+        if requested_t == self.pending_hpa_target:
+            self.pending_hpa_count += 1
+        else:
+            self.pending_hpa_target = requested_t
+            self.pending_hpa_count = 1
+
+        if self.pending_hpa_count >= self.HPA_DEBOUNCE_STEPS and requested_t != self.hpa_target:
             self.prev_hpa_target = self.hpa_target
-            self.hpa_target = new_t
-            patch = {"spec": {"metrics": [{"type": "Resource","resource": {"name": "cpu","target": {"type": "Utilization","averageUtilization": new_t}}}]}}
+            self.hpa_target = requested_t
+            patch = {"spec": {"metrics": [{"type": "Resource","resource": {"name": "cpu","target": {"type": "Utilization","averageUtilization": requested_t}}}]}}
             try:
                 subprocess.run(['kubectl', 'patch', 'hpa', application, '-n', app_env, '--patch', json.dumps(patch)], check=True, stdout=subprocess.DEVNULL)
             except subprocess.CalledProcessError:
-                logging.error(f"Failed to patch HPA to {new_t}%")
+                logging.error(f"Failed to patch HPA to {requested_t}%")
 
         # action[1] = throughput multiplier, action[2] = enhancement
         # (dead learning-rate action removed; indices shifted from original)
@@ -471,6 +496,8 @@ class MultiAgentClusterEnv(gym.Env):
 
     def reset(self, seed=None, options=None):
         self.days = 0; self.steps = 0; self.forecast_running_avg = 100.0
+        self.pending_hpa_target = cpu_target_percentage
+        self.pending_hpa_count = 0
         logging.info("♻️  Resetting Cluster...")
         
         # 1. Clean up old HPA
@@ -576,13 +603,47 @@ class TensorboardCallback(BaseCallback):
 
 def lr_schedule(progress): return 2e-4 * 0.5 * (1 + np.cos(np.pi * (1 - progress)))
 
+class CheckpointWithVecNorm(BaseCallback):
+    """Saves model + VecNormalize stats together every save_freq steps."""
+    def __init__(self, save_freq, save_path, vec_env):
+        super().__init__()
+        self.save_freq = save_freq
+        self.save_path = save_path
+        self.vec_env = vec_env
+
+    def _on_step(self):
+        if self.num_timesteps % self.save_freq == 0:
+            os.makedirs(self.save_path, exist_ok=True)
+            self.model.save(f"{self.save_path}/ckpt_{self.num_timesteps}_steps")
+            self.vec_env.save(f"{self.save_path}/vecnorm_{self.num_timesteps}_steps.pkl")
+            logging.info(f"Checkpoint saved at step {self.num_timesteps}")
+        return True
+
+def find_latest_checkpoint(ckpt_dir):
+    """Returns (model_path, vecnorm_path, steps_done) for the best complete checkpoint, or (None, None, 0).
+    Iterates from largest to smallest step count so a missing vecnorm on the latest checkpoint
+    falls back to the previous one rather than forcing a full restart."""
+    zips = glob.glob(f"{ckpt_dir}/ckpt_*_steps.zip")
+    if not zips:
+        return None, None, 0
+    steps = sorted(
+        [int(re.search(r'ckpt_(\d+)_steps', z).group(1)) for z in zips],
+        reverse=True
+    )
+    for n in steps:
+        m = f"{ckpt_dir}/ckpt_{n}_steps.zip"
+        v = f"{ckpt_dir}/vecnorm_{n}_steps.pkl"
+        if os.path.exists(m) and os.path.exists(v):
+            return m, v, n
+    return None, None, 0
+
 if __name__ == "__main__":
     import argparse
     import datetime
 
     parser = argparse.ArgumentParser(description="Attention Double-LSTM PPO autoscaler")
     parser.add_argument("--mode",    default="train", choices=["train", "test"])
-    parser.add_argument("--url",     type=str, required=True, help="Service base URL, e.g. http://192.168.122.2:30001/")
+    parser.add_argument("--url",     type=str, required=True, help="Service base URL, e.g. http://<cluster-ip>:<port>/")
     parser.add_argument("--seed",    type=int, default=42,    help="Random seed (use different values for multi-seed eval)")
     parser.add_argument("--window",  type=int, default=8,     help="Attention history window size (steps)")
     parser.add_argument("--no-aux",  action="store_true",     help="Disable throughput multiplier and enhancement (fair HPA comparison)")
@@ -625,23 +686,41 @@ if __name__ == "__main__":
 
     # TRAIN MODE
     if args.mode == "train":
-        logging.info(f"Training | seed={SEED} window={WINDOW_SIZE} no_aux={no_aux} | log={train_csv}")
-        vec_train = VecNormalize(DummyVecEnv([lambda: build_env(tr_days)]), norm_obs=True, norm_reward=False, clip_obs=10.)
+        final_model_path = f"{log_dir}/final_model.zip"
+        if os.path.exists(final_model_path):
+            logging.info("Training already complete (final model exists). Skipping.")
+        else:
+            logging.info(f"Training | seed={SEED} window={WINDOW_SIZE} no_aux={no_aux} | log={train_csv}")
+            ckpt_dir = f"{log_dir}/ckpt"
+            ckpt_model, ckpt_vecnorm, ckpt_steps = find_latest_checkpoint(ckpt_dir)
 
-        model = PPO(
-            "MlpPolicy", vec_train, verbose=1, device=device,
-            policy_kwargs=dict(features_extractor_class=AttentionDoubleLSTM,
-                               features_extractor_kwargs=dict(features_dim=256)),
-            learning_rate=lr_schedule, n_steps=512, n_epochs=10,
-            gae_lambda=0.93, ent_coef=0.01, tensorboard_log=f"{log_dir}/tb"
-        )
+            base_env = DummyVecEnv([lambda: build_env(tr_days)])
+            total_steps = len(tr_days) * MINUTES_PER_DAY
+            remaining_steps = total_steps - ckpt_steps
 
-        cbs = [DetailedLoggingCallback(), TensorboardCallback(train_csv), CheckpointCallback(500, f"{log_dir}/ckpt")]
-        model.learn(total_timesteps=len(tr_days) * MINUTES_PER_DAY, callback=cbs)
+            if ckpt_model and ckpt_vecnorm:
+                logging.info(f"Resuming from checkpoint at step {ckpt_steps} ({remaining_steps} steps left)")
+                vec_train = VecNormalize.load(ckpt_vecnorm, base_env)
+                model = PPO.load(ckpt_model, env=vec_train, device=device)
+                model.set_env(vec_train)
+            else:
+                vec_train = VecNormalize(base_env, norm_obs=True, norm_reward=False, clip_obs=10.)
+                model = PPO(
+                    "MlpPolicy", vec_train, verbose=1, device=device,
+                    policy_kwargs=dict(features_extractor_class=AttentionDoubleLSTM,
+                                       features_extractor_kwargs=dict(features_dim=256)),
+                    learning_rate=lr_schedule, n_steps=512, n_epochs=10,
+                    gae_lambda=0.93, ent_coef=0.01, tensorboard_log=f"{log_dir}/tb"
+                )
 
-        model.save(f"{log_dir}/final_model")
-        vec_train.save(f"{log_dir}/vecnorm.pkl")
-        logging.info(f"Training complete. Model saved to {log_dir}/")
+            cbs = [DetailedLoggingCallback(), TensorboardCallback(train_csv),
+                   CheckpointWithVecNorm(500, ckpt_dir, vec_train)]
+            model.learn(total_timesteps=remaining_steps, callback=cbs,
+                        reset_num_timesteps=(ckpt_steps == 0))
+
+            model.save(f"{log_dir}/final_model")
+            vec_train.save(f"{log_dir}/vecnorm.pkl")
+            logging.info(f"Training complete. Model saved to {log_dir}/")
 
     # TEST MODE
     if args.mode == "test":
