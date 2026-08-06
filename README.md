@@ -12,7 +12,7 @@ Code, configuration files, and result logs for the experiments in the paper. Fou
 |---|---|---|
 | `double-lstm_agent.py` | Proposed | Attention + Double LSTM + PPO |
 | `single-lstm_agent.py` | Baseline | Single LSTM + PPO (no attention) |
-| `ddqn_agent.py` | Baseline | Double DQN (MlpPolicy, no forecast) |
+| `keda_baseline.py` | Baseline | KEDA HTTP add-on, reactive request-rate autoscaling |
 | `static-hpa50.py` | Benchmark | Kubernetes HPA at 50% CPU target |
 
 ---
@@ -23,7 +23,7 @@ Code, configuration files, and result logs for the experiments in the paper. Fou
 .
 ├── double-lstm_agent.py        # Proposed: Attention + Double LSTM + PPO
 ├── single-lstm_agent.py        # Baseline: Single LSTM + PPO
-├── ddqn_agent.py               # Baseline: Double DQN
+├── keda_baseline.py            # Baseline: KEDA HTTP add-on (reactive)
 ├── static-hpa50.py             # Benchmark: Static HPA @ 50% CPU
 │
 ├── app.py                      # Factorizator Flask app (the workload being scaled)
@@ -37,6 +37,8 @@ Code, configuration files, and result logs for the experiments in the paper. Fou
 ├── factorizator-deployment.yaml# K8s deployment
 ├── factorizator-service.yaml   # K8s service
 ├── hpa.yaml                    # HorizontalPodAutoscaler
+├── keda-httpscaledobject.yaml  # KEDA HTTPScaledObject for the factorizator deployment
+├── keda-interceptor-nodeport.yaml # NodePort exposing the KEDA HTTP add-on interceptor
 ├── RBAC.yaml                   # RBAC for metrics access
 │
 ├── requirements.txt            # Python dependencies
@@ -54,6 +56,7 @@ Code, configuration files, and result logs for the experiments in the paper. Fou
 - [`hey`](https://github.com/rakyll/hey) load generator on `$PATH`
 - Docker
 - Prometheus and metrics-server in the cluster
+- [KEDA](https://keda.sh) with the [HTTP add-on](https://github.com/kedacore/http-add-on) installed, for the `keda_baseline.py` benchmark
 
 ---
 
@@ -127,11 +130,15 @@ python single-lstm_agent.py --mode train --url http://localhost:8080
 python single-lstm_agent.py --mode test  --url http://localhost:8080
 ```
 
-### Baseline: Double DQN
+### Baseline: KEDA
+
+Reactive, non-learning baseline — no training phase. Deploy the HTTPScaledObject and
+interceptor NodePort, then run:
 
 ```bash
-python ddqn_agent.py --mode train --url http://localhost:8080
-python ddqn_agent.py --mode test  --url http://localhost:8080
+kubectl apply -f keda-httpscaledobject.yaml
+kubectl apply -f keda-interceptor-nodeport.yaml
+python keda_baseline.py --seed 42
 ```
 
 ### Benchmark: Static HPA @ 50%
@@ -153,14 +160,29 @@ chmod +x launch_experiment.sh
 
 ## Results
 
-Test logs (1000 steps each) are in `Results-CSVs/`:
+`Results-CSVs/` contains two generations of logs:
+
+**Original single-seed submission** (flat files, 1000-step test logs, seed 42 only):
 
 | File | Method |
 |---|---|
 | `test_log_Double-LSTM.csv` | Proposed (Attention + Double LSTM) |
 | `test_log_Single-LSTM.csv` | Single LSTM baseline |
-| `test_log_DDQN.csv` | Double DQN baseline |
 | `test_log_static-hpa.csv` | Static HPA benchmark |
+
+**Revised 5-seed, 2-cluster evaluation** (`Double-LSTM/`, `Single-LSTM/`, `KEDA/`), each with
+train/test CSVs nested as `<Method>/<Cluster>/seed<seed>/`, `Cluster` = `C1` (4-worker) or
+`C2` (1-worker):
+
+| Folder | Method |
+|---|---|
+| `Double-LSTM/` | Proposed (Attention + Double LSTM), seeds 123/456/789/1337/2024 |
+| `Single-LSTM/` | Single LSTM baseline, same 5 seeds |
+| `KEDA/` | KEDA HTTP add-on baseline, reactive request-rate autoscaling, seed 42 only |
+
+The DDQN baseline from the original submission was dropped: it collapsed to a fixed
+1-replica policy on the revised testbed and is superseded by KEDA as a stronger,
+industry-standard reactive baseline.
 
 To plot the results:
 
@@ -169,6 +191,9 @@ python visualize_results.py
 ```
 
 CSV columns (RL agents): `Step, Reward, Latency_P90, Latency_Avg, Replicas, CPU_Pct, RAM_Pct, Requests, Total_CPU, Total_RAM, Success, HPA_Target, Throughput, Enhancement, Forecast`
+
+The 5-seed, 2-cluster CSVs additionally carry a leading `Cluster` column (`C1`/`C2`) and,
+depending on method/log type, `Latency_P50`/`Latency_P95`/`Latency_P99`.
 
 ---
 
