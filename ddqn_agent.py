@@ -5,7 +5,7 @@
 
 import os, sys, math, torch, numpy as np, pandas as pd
 import subprocess, random, re, json, logging, time, warnings, csv, requests
-import datetime, argparse
+import datetime, argparse, glob
 
 from stable_baselines3 import DQN
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
@@ -40,10 +40,10 @@ def get_random_days(df, n_days=7, train_days=5, test_days=2, seed=None):
     selected = random.sample(list(all_days), min(n_days, len(all_days)))
     return selected[:train_days], selected[train_days:train_days + test_days]
 
-def wait_for_service(url, max_retries=5):
+def wait_for_service(url, max_retries=20):
     for i in range(max_retries):
         try:
-            if requests.get(f"{url}factor?n=1", timeout=3).status_code == 200:
+            if requests.get(f"{url}factor?n=1", timeout=8).status_code == 200:
                 logging.info("Service UP.")
                 return True
         except Exception:
@@ -66,9 +66,10 @@ class DQNClusterEnv(gym.Env):
         self.df = add_day_column(self.df)
         self.day_list = day_list
 
-        # [4 HPA targets] x [3 throughput multipliers] x [3 enhancement levels] = 36
+        # [4 HPA targets] x [3 throughput multipliers] = 12
         # Dead learning-rate action removed (was action[1] in original [4,3,3,3] encoding).
-        self.action_space = gym.spaces.Discrete(4 * 3 * 3)
+        # Dead enhancement action/state field removed (never modified scaling behavior).
+        self.action_space = gym.spaces.Discrete(4 * 3)
 
         self.invocation_matrix = self._make_matrix()
         self.days_train = len(day_list)
@@ -76,16 +77,15 @@ class DQNClusterEnv(gym.Env):
         self.steps = 0; self.days = 0; self.global_step = 0
         self.hpa_target = 50
         self.throughput_multiplier = 1.0
-        self.enhancement = 0
         self.last_replicas = 1
         self.reward = 0.0
         self._latency_p90 = 0.05; self._latency_avg = 0.05; self._success_ratio = 1.0
 
-        # 13-dim state (no forecast signal — ablation vs Double-LSTM's 14-dim)
-        low  = np.array([0.001, 1,   0,   0,   0,    0,    0,    0, 1,  1.0, 0, -1, -1], dtype=np.float32)
-        high = np.array([0.150, 200, 200, 100, 3600, 1800, 1800, 1, 95, 3.0, 2,  1,  1], dtype=np.float32)
+        # 12-dim state (no forecast signal — ablation vs Double-LSTM's 13-dim)
+        low  = np.array([0.001, 1,   0,   0,   0,    0,    0,    0, 1,  1.0, -1, -1], dtype=np.float32)
+        high = np.array([0.150, 200, 200, 100, 3600, 1800, 1800, 1, 95, 3.0,  1,  1], dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
-        self._init_state = np.array([0.05, 1, 30, 40, 100, 1500, 2000, 1, 50, 1.0, 0, 1, 0], dtype=np.float32)
+        self._init_state = np.array([0.05, 1, 30, 40, 100, 1500, 2000, 1, 50, 1.0, 1, 0], dtype=np.float32)
         self.state = self._init_state.copy()
 
     def _make_matrix(self):
@@ -99,14 +99,13 @@ class DQNClusterEnv(gym.Env):
         return matrix
 
     def decode_action(self, a: int):
-        # Decode flat index → [hpa_idx, throughput_idx, enhancement_idx]
-        a = int(a) % 36
-        a0 = a // 9        # HPA target:  0–3
-        a1 = (a % 9) // 3  # Throughput:  0–2
-        a2 = a % 3         # Enhancement: 0–2
-        return a0, a1, a2
+        # Decode flat index → [hpa_idx, throughput_idx]
+        a = int(a) % 12
+        a0 = a // 3  # HPA target:  0–3
+        a1 = a % 3   # Throughput:  0–2
+        return a0, a1
 
-    def apply_action(self, a0, a1, a2):
+    def apply_action(self, a0, a1):
         new_t = [30, 50, 70, 90][a0]
         if new_t != self.hpa_target:
             self.hpa_target = new_t
@@ -122,7 +121,6 @@ class DQNClusterEnv(gym.Env):
 
         if not self.no_aux:
             self.throughput_multiplier = [1.0, 2.0, 3.0][a1]
-            self.enhancement = a2
 
     def _run_hey(self):
         day_idx = min(self.days, len(self.day_list) - 1)
@@ -181,7 +179,7 @@ class DQNClusterEnv(gym.Env):
         return np.array([self._latency_p90, reps, cpu, ram,
                          reqs * self.throughput_multiplier, t_cpu, t_ram,
                          self._success_ratio, self.hpa_target,
-                         self.throughput_multiplier, self.enhancement,
+                         self.throughput_multiplier,
                          math.cos(angle), math.sin(angle)], dtype=np.float32)
 
     def _compute_reward(self):
@@ -206,8 +204,8 @@ class DQNClusterEnv(gym.Env):
         return self.reward
 
     def step(self, action):
-        a0, a1, a2 = self.decode_action(int(action))
-        self.apply_action(a0, a1, a2)
+        a0, a1 = self.decode_action(int(action))
+        self.apply_action(a0, a1)
         reqs = self._run_hey()
         raw = self._get_state(reqs)
         low = self.observation_space.low; high = self.observation_space.high
@@ -224,7 +222,7 @@ class DQNClusterEnv(gym.Env):
         super().reset(seed=seed)
         self.days = 0; self.steps = 0; self.global_step = 0
         self.hpa_target = 50; self.throughput_multiplier = 1.0
-        self.enhancement = 0; self.last_replicas = 1
+        self.last_replicas = 1
         subprocess.run(['kubectl', 'delete', 'hpa', application, '-n', app_env],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(['kubectl', 'scale', 'deploy', application, '-n', app_env, '--replicas=1'],
@@ -236,6 +234,43 @@ class DQNClusterEnv(gym.Env):
         time.sleep(5)
         self.state = self._init_state.copy()
         return self.state, {}
+
+# ============================================================
+# CHECKPOINT HELPERS
+# ============================================================
+class CheckpointWithVecNorm(BaseCallback):
+    """Saves model + VecNormalize stats together every save_freq steps."""
+    def __init__(self, save_freq, save_path, vec_env):
+        super().__init__()
+        self.save_freq = save_freq
+        self.save_path = save_path
+        self.vec_env = vec_env
+
+    def _on_step(self):
+        if self.num_timesteps % self.save_freq == 0:
+            os.makedirs(self.save_path, exist_ok=True)
+            self.model.save(f"{self.save_path}/ckpt_{self.num_timesteps}_steps")
+            self.vec_env.save(f"{self.save_path}/vecnorm_{self.num_timesteps}_steps.pkl")
+            logging.info(f"Checkpoint saved at step {self.num_timesteps}")
+        return True
+
+def find_latest_checkpoint(ckpt_dir):
+    """Returns (model_path, vecnorm_path, steps_done) for the best complete checkpoint, or (None, None, 0).
+    Iterates from largest to smallest step count so a missing vecnorm on the latest checkpoint
+    falls back to the previous one rather than forcing a full restart."""
+    zips = glob.glob(f"{ckpt_dir}/ckpt_*_steps.zip")
+    if not zips:
+        return None, None, 0
+    steps = sorted(
+        [int(re.search(r'ckpt_(\d+)_steps', z).group(1)) for z in zips],
+        reverse=True
+    )
+    for n in steps:
+        m = f"{ckpt_dir}/ckpt_{n}_steps.zip"
+        v = f"{ckpt_dir}/vecnorm_{n}_steps.pkl"
+        if os.path.exists(m) and os.path.exists(v):
+            return m, v, n
+    return None, None, 0
 
 # ============================================================
 # CALLBACK
@@ -276,7 +311,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed",    type=int, default=42)
     parser.add_argument("--log-dir", type=str, default="results_log_ddqn")
     parser.add_argument("--no-aux",  action="store_true",
-                        help="Fix throughput multiplier=1.0 and enhancement=0 (fair HPA comparison)")
+                        help="Fix throughput multiplier=1.0 (fair HPA comparison)")
     args = parser.parse_args()
 
     SEED = args.seed
@@ -295,36 +330,53 @@ if __name__ == "__main__":
     tr_days, te_days = get_random_days(df, seed=SEED)
 
     if args.mode == "train":
-        logging.info(f"Starting Double DQN training | seed={SEED} | log={log_dir}")
-        env = DummyVecEnv([lambda: DQNClusterEnv(
-            "AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt",
-            tr_days, args.url, no_aux=args.no_aux)])
-        env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+        final_model_path = os.path.join(log_dir, "ddqn_model.zip")
+        if os.path.exists(final_model_path):
+            logging.info("Training already complete (final model exists). Skipping.")
+        else:
+            logging.info(f"Starting Double DQN training | seed={SEED} | log={log_dir}")
+            ckpt_dir = os.path.join(log_dir, "ckpt")
+            ckpt_model, ckpt_vecnorm, ckpt_steps = find_latest_checkpoint(ckpt_dir)
 
-        total_steps = len(tr_days) * MINUTES_PER_DAY   # 5 × 500 = 2500
+            base_env = DummyVecEnv([lambda: DQNClusterEnv(
+                "AzureFunctionsInvocationTraceForTwoWeeksJan2021.txt",
+                tr_days, args.url, no_aux=args.no_aux)])
 
-        model = DQN(
-            "MlpPolicy", env,
-            verbose=1,
-            learning_rate=1e-4,
-            gamma=0.99,
-            buffer_size=min(total_steps, 5000),   # right-sized for available data
-            batch_size=32,
-            learning_starts=50,                   # begin after 50 warm-up steps
-            train_freq=1,                         # update every step (max use of data)
-            gradient_steps=1,
-            target_update_interval=500,           # update target network ~5× during training
-            exploration_fraction=0.4,             # explore 40% of training (1000 steps)
-            exploration_final_eps=0.05,
-            optimize_memory_usage=False,
-            tensorboard_log=os.path.join(log_dir, "tb"),
-            device=device,
-        )
-        cb = CSVCallback(os.path.join(log_dir, f"ddqn_train_{ts}.csv"))
-        model.learn(total_timesteps=total_steps, callback=cb)
-        model.save(os.path.join(log_dir, "ddqn_model"))
-        env.save(os.path.join(log_dir, "vecnorm.pkl"))
-        logging.info("Double DQN training complete.")
+            total_steps = len(tr_days) * MINUTES_PER_DAY   # 5 × 500 = 2500
+            remaining_steps = total_steps - ckpt_steps
+
+            if ckpt_model and ckpt_vecnorm:
+                logging.info(f"Resuming from checkpoint at step {ckpt_steps} ({remaining_steps} steps left)")
+                env = VecNormalize.load(ckpt_vecnorm, base_env)
+                model = DQN.load(ckpt_model, env=env, device=device)
+                model.set_env(env)
+            else:
+                env = VecNormalize(base_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+                model = DQN(
+                    "MlpPolicy", env,
+                    verbose=1,
+                    learning_rate=1e-4,
+                    gamma=0.99,
+                    buffer_size=min(total_steps, 5000),
+                    batch_size=32,
+                    learning_starts=50,
+                    train_freq=1,
+                    gradient_steps=1,
+                    target_update_interval=500,
+                    exploration_fraction=0.4,
+                    exploration_final_eps=0.05,
+                    optimize_memory_usage=False,
+                    tensorboard_log=os.path.join(log_dir, "tb"),
+                    device=device,
+                )
+
+            cbs = [CSVCallback(os.path.join(log_dir, f"ddqn_train_{ts}.csv")),
+                   CheckpointWithVecNorm(500, ckpt_dir, env)]
+            model.learn(total_timesteps=remaining_steps, callback=cbs,
+                        reset_num_timesteps=(ckpt_steps == 0))
+            model.save(os.path.join(log_dir, "ddqn_model"))
+            env.save(os.path.join(log_dir, "vecnorm.pkl"))
+            logging.info("Double DQN training complete.")
 
     elif args.mode == "test":
         logging.info(f"Starting Double DQN evaluation | seed={SEED} | log={log_dir}")

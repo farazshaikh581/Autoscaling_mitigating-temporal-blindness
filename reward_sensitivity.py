@@ -6,7 +6,7 @@ Recomputes per-step reward components from raw metrics and applies
 ±50% perturbations to each weight, one at a time.
 
 Usage (after experiments complete):
-    python reward_sensitivity.py --results-dir results/
+    python reward_sensitivity.py --results-dir results/ --seed 42
 
 Output:
     reward_sensitivity_table.csv   — mean reward per agent per weight config
@@ -15,7 +15,6 @@ Output:
 
 import argparse
 import glob
-import math
 import os
 
 import matplotlib.pyplot as plt
@@ -23,29 +22,41 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
-# ── Reward constants (must match double-lstm_agent.py) ───────────────────────
-# CSV stores latency in ms (agent multiplies by 1000 before writing),
+# ── Reward constants (must match ddqn_agent.py / dlstm_agent.py / keda_baseline.py) ──
+# CSV stores latency in ms (agents multiply by 1000 before writing),
 # so convert L_TARGET and L_THRESH to ms here.
 L_TARGET          = 20.0    # ms  (0.020 s in agent code)
 L_THRESH          = 50.0    # ms  (0.050 s in agent code)
-NOMINAL_CAP       = 100.0   # req/min per replica at target CPU
+NATIVE_HPA_TARGET = 50.0    # CPU% target used when a CSV has no HPA_Target column (KEDA)
 
+# Weights as actually implemented (2026-07-30 audit): the reward formula is
+# 0.55*r_sla + 0.25*r_cpu + 0.08*r_stab + 0.12*r_succ everywhere (ddqn_agent.py,
+# dlstm_agent.py, keda_baseline.py). There is no standalone forecast reward term
+# any more -- dlstm_agent.py:248 computes "0.50*r_slo + ... + 0.05*r_slo", i.e. the
+# weight that used to belong to a forecast-quality term (W_FCST) was redistributed
+# onto r_sla itself, not onto a genuine forecast signal (see
+# double_lstm_forecast_analysis memory: the forecast state feature has no dedicated
+# reward incentive). The previous version of this script still modeled a separate
+# W_FCST weight and an r_fcst() component -- that no longer corresponds to anything
+# in the actual reward computation, so it's removed rather than perturbed.
 BASELINE_WEIGHTS  = {
-    "W_SLA":  0.50,
+    "W_SLA":  0.55,
     "W_CPU":  0.25,
     "W_STAB": 0.08,
-    "W_FCST": 0.05,
     "W_SUCC": 0.12,
 }
 
 PERTURBATIONS = [-0.50, 0.0, +0.50]   # −50 %, baseline, +50 %
 
-AGENTS = ["static_hpa", "drqn", "single_lstm", "double_lstm"]
+# DDQN removed 2026-07-30 (replaced by KEDA, see response_R4.2_DDQN_justification.md).
+# "double_lstm" (old vanilla PPO version) superseded by "dlstm" (Double-LSTM-v2,
+# DQN + AttentionDoubleLSTM extractor, see dlstm_ddqn_variant_jul19 memory).
+AGENTS = ["static_hpa", "single_lstm", "dlstm", "keda"]
 AGENT_LABELS = {
-    "static_hpa":   "Static HPA",
-    "drqn":         "DRQN",
-    "single_lstm":  "Single-LSTM",
-    "double_lstm":  "Double-LSTM (ours)",
+    "static_hpa":  "Static HPA",
+    "single_lstm": "Single-LSTM",
+    "dlstm":       "Double-LSTM-v2 (ours)",
+    "keda":        "KEDA",
 }
 
 # ── Component reward functions ────────────────────────────────────────────────
@@ -72,19 +83,17 @@ def r_succ(succ):
         return 1.0
     return float(np.log(max(succ, 1e-6)))
 
-def r_fcst(eff_req, forecast, C=NOMINAL_CAP):
-    err = (eff_req - forecast) / max(C, 1e-6)
-    return -(err ** 2)
-
 def compute_components(df):
     """Return dict of per-step component arrays from a test CSV."""
-    lat   = df["Latency_P90"].values
-    cpu   = df["CPU_Pct"].values
-    reps  = df["Replicas"].values
-    succ  = df["Success"].values
-    hpa_t = df["HPA_Target"].values
-    ereq  = (df["Requests"] * df["Throughput"]).values
-    fcast = df["Forecast"].values
+    lat  = df["Latency_P90"].values
+    cpu  = df["CPU_Pct"].values
+    reps = df["Replicas"].values
+    succ = df["Success"].values
+    # KEDA's CSV has no HPA_Target column (it has no CPU target of its own) --
+    # keda_baseline.py's own reward computation centers r_cpu on the native-HPA
+    # default (50%) in that case, so we do the same here for consistency.
+    hpa_t = df["HPA_Target"].values if "HPA_Target" in df.columns \
+        else np.full(len(df), NATIVE_HPA_TARGET)
 
     prev_reps = np.concatenate([[reps[0]], reps[:-1]])
     delta     = np.abs(reps - prev_reps)
@@ -94,25 +103,39 @@ def compute_components(df):
         "r_cpu":  np.array([r_cpu(c, t) for c, t in zip(cpu, hpa_t)]),
         "r_stab": np.array([r_stab(d) for d in delta]),
         "r_succ": np.array([r_succ(s) for s in succ]),
-        "r_fcst": np.array([r_fcst(e, f) for e, f in zip(ereq, fcast)]),
     }
 
-def weighted_reward(components, w_sla, w_cpu, w_stab, w_fcst, w_succ):
+def weighted_reward(components, w_sla, w_cpu, w_stab, w_succ):
     return (w_sla  * components["r_sla"]
           + w_cpu  * components["r_cpu"]
           + w_stab * components["r_stab"]
-          + w_fcst * components["r_fcst"]
           + w_succ * components["r_succ"])
 
 # ── Load best test CSV per agent (seed 42 by default) ────────────────────────
-def load_agent_components(results_dir, agent, seed=42):
-    pattern = os.path.join(results_dir, agent, f"seed{seed}", "test_log_*.csv")
+def _find_csv(pattern):
     files = sorted(glob.glob(pattern))
-    if not files:
-        print(f"  WARNING: no test CSV found for {agent}/seed{seed} — skipping")
+    return files[-1] if files else None
+
+def load_agent_components(results_dir, agent, seed=42):
+    """Path layout differs by agent -- static_hpa/single_lstm/dlstm share
+    results/{agent}/seed{N}/*test*.csv; KEDA writes to a differently-shaped
+    results_log_keda/seed{N}_target{N}_mult{N}/keda_test_*.csv (see
+    keda_baseline.py's own log_dir construction)."""
+    if agent == "keda":
+        # target-rpm/load-multiplier are script defaults (100, 3.0) -- glob over
+        # them rather than hardcoding, in case a run used non-default values.
+        pattern = os.path.join(results_dir, "..", "results_log_keda",
+                                f"seed{seed}_target*_mult*", "keda_test_*.csv")
+        path = _find_csv(pattern)
+    else:
+        prefix = {"static_hpa": "test_log", "single_lstm": "test_log", "dlstm": "dlstm_test"}[agent]
+        pattern = os.path.join(results_dir, agent, f"seed{seed}", f"{prefix}_*.csv")
+        path = _find_csv(pattern)
+
+    if not path:
+        print(f"  WARNING: no test CSV found for {agent}/seed{seed} (pattern: {pattern}) — skipping")
         return None
-    df = pd.read_csv(files[-1])
-    return compute_components(df)
+    return compute_components(pd.read_csv(path))
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
@@ -156,7 +179,7 @@ def main():
                 rewards = weighted_reward(
                     comps,
                     w_sla=w["W_SLA"], w_cpu=w["W_CPU"], w_stab=w["W_STAB"],
-                    w_fcst=w["W_FCST"], w_succ=w["W_SUCC"],
+                    w_succ=w["W_SUCC"],
                 )
                 row[AGENT_LABELS[agent]] = float(np.mean(rewards))
             rows.append(row)

@@ -115,8 +115,9 @@ class DRQNClusterEnv(gym.Env):
         self.df = add_day_column(self.df)
         self.day_list = day_list
 
-        # [4 HPA targets] × [3 throughput] × [3 enhancement] = 36
-        self.action_space = gym.spaces.Discrete(4 * 3 * 3)
+        # [4 HPA targets] × [3 throughput] = 12
+        # Dead enhancement action/state field removed (never modified scaling behavior).
+        self.action_space = gym.spaces.Discrete(4 * 3)
 
         self.invocation_matrix = self._make_matrix()
         self.days_train = len(day_list)
@@ -124,16 +125,15 @@ class DRQNClusterEnv(gym.Env):
         self.steps = 0; self.days = 0; self.global_step = 0
         self.hpa_target = 50
         self.throughput_multiplier = 1.0
-        self.enhancement = 0
         self.last_replicas = 1
         self.reward = 0.0
         self._latency_p90 = 0.05; self._latency_avg = 0.05; self._success_ratio = 1.0
 
-        # 13-dim state (no forecast — same as DDQN for direct comparison)
-        low  = np.array([0.001, 1,   0,   0,   0,    0,    0,    0, 1,  1.0, 0, -1, -1], dtype=np.float32)
-        high = np.array([0.150, 200, 200, 100, 3600, 1800, 1800, 1, 95, 3.0, 2,  1,  1], dtype=np.float32)
+        # 12-dim state (no forecast — same as DDQN for direct comparison)
+        low  = np.array([0.001, 1,   0,   0,   0,    0,    0,    0, 1,  1.0, -1, -1], dtype=np.float32)
+        high = np.array([0.150, 200, 200, 100, 3600, 1800, 1800, 1, 95, 3.0,  1,  1], dtype=np.float32)
         self.observation_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
-        self._init_state = np.array([0.05, 1, 30, 40, 100, 1500, 2000, 1, 50, 1.0, 0, 1, 0], dtype=np.float32)
+        self._init_state = np.array([0.05, 1, 30, 40, 100, 1500, 2000, 1, 50, 1.0, 1, 0], dtype=np.float32)
         self.state = self._init_state.copy()
 
     def _make_matrix(self):
@@ -147,10 +147,10 @@ class DRQNClusterEnv(gym.Env):
         return matrix
 
     def decode_action(self, a: int):
-        a = int(a) % 36
-        return a // 9, (a % 9) // 3, a % 3   # hpa_idx, throughput_idx, enhancement_idx
+        a = int(a) % 12
+        return a // 3, a % 3   # hpa_idx, throughput_idx
 
-    def apply_action(self, a0, a1, a2):
+    def apply_action(self, a0, a1):
         new_t = [30, 50, 70, 90][a0]
         if new_t != self.hpa_target:
             self.hpa_target = new_t
@@ -165,7 +165,6 @@ class DRQNClusterEnv(gym.Env):
                 pass
         if not self.no_aux:
             self.throughput_multiplier = [1.0, 2.0, 3.0][a1]
-            self.enhancement = a2
 
     def _run_hey(self):
         day_idx = min(self.days, len(self.day_list) - 1)
@@ -222,7 +221,7 @@ class DRQNClusterEnv(gym.Env):
         return np.array([self._latency_p90, reps, cpu, ram,
                          reqs * self.throughput_multiplier, t_cpu, t_ram,
                          self._success_ratio, self.hpa_target,
-                         self.throughput_multiplier, self.enhancement,
+                         self.throughput_multiplier,
                          math.cos(angle), math.sin(angle)], dtype=np.float32)
 
     def _compute_reward(self):
@@ -243,8 +242,8 @@ class DRQNClusterEnv(gym.Env):
         return self.reward
 
     def step(self, action):
-        a0, a1, a2 = self.decode_action(int(action))
-        self.apply_action(a0, a1, a2)
+        a0, a1 = self.decode_action(int(action))
+        self.apply_action(a0, a1)
         reqs = self._run_hey()
         raw = self._get_state(reqs)
         self.state = np.clip(raw, self.observation_space.low, self.observation_space.high)
@@ -259,7 +258,7 @@ class DRQNClusterEnv(gym.Env):
         super().reset(seed=seed)
         self.days = 0; self.steps = 0; self.global_step = 0
         self.hpa_target = 50; self.throughput_multiplier = 1.0
-        self.enhancement = 0; self.last_replicas = 1
+        self.last_replicas = 1
         subprocess.run(['kubectl', 'delete', 'hpa', application, '-n', app_env],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(['kubectl', 'scale', 'deploy', application, '-n', app_env, '--replicas=1'],

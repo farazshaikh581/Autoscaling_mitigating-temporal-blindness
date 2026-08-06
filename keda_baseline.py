@@ -76,20 +76,26 @@ def parse_hey(output):
     avg = re.search(r"Average:\s+([\d.]+)\s+secs", output)
     lat_p90 = float(p90.group(1)) if p90 else 0.05
     lat_avg = float(avg.group(1)) if avg else 0.05
+    # hey prints 10/25/50/75/90/95/99% lines; the original parser kept only 90%.
+    # Falls back to P90 when a bucket is unpopulated on a low-sample idle step.
+    def pct(tag):
+        m = re.search(r"%s%%\s+in\s+([\d.]+)\s+secs" % tag, output)
+        return float(m.group(1)) if m else lat_p90
+    lat_p50, lat_p95, lat_p99 = pct("50"), pct("95"), pct("99")
     status = re.findall(r"\[(\d+)\]\s+(\d+)\s+responses", output)
     counts = {int(k): int(v) for k, v in status}
     if counts:
         succ = counts.get(200, 0) / sum(counts.values())
     else:
         succ = 1.0 if "Error distribution" not in output else 0.0
-    return lat_avg, lat_p90, succ
+    return lat_avg, lat_p50, lat_p90, lat_p95, lat_p99, succ
 
 def run_hey(url, raw_requests, host_header=False, duration="60s", load_multiplier=1.0):
     """Same concurrency/QPS formula as the RL agents' client. Returns
-    (effective_reqs, lat_avg, lat_p90, succ)."""
+    (effective_reqs, lat_avg, lat_p50, lat_p90, lat_p95, lat_p99, succ)."""
     if raw_requests < 1.0:
         time.sleep(60)
-        return 0.0, 0.005, 0.005, 1.0
+        return 0.0, 0.005, 0.005, 0.005, 0.005, 0.005, 1.0
     concurrency = max(1, min(int(raw_requests / 10), 10))
     target_qps  = (raw_requests * load_multiplier) / 60.0
     # hey ignores Host set via -H, needs -host or the interceptor 404s everything
@@ -101,9 +107,10 @@ def run_hey(url, raw_requests, host_header=False, duration="60s", load_multiplie
         output = result.stdout + "\n" + result.stderr
     except Exception as e:
         logging.error(f"hey error: {e}")
-        return raw_requests * load_multiplier, 1.0, 1.0, 0.0
-    lat_avg, lat_p90, succ = parse_hey(output)
-    return raw_requests * load_multiplier, lat_avg, lat_p90, succ
+        return raw_requests * load_multiplier, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0
+    lat_avg, lat_p50, lat_p90, lat_p95, lat_p99, succ = parse_hey(output)
+    return (raw_requests * load_multiplier, lat_avg, lat_p50, lat_p90,
+            lat_p95, lat_p99, succ)
 
 def calibrate_interceptor_overhead(app_url, interceptor_url, rounds, log_dir):
     """Direct-vs-interceptor latency at fixed load (60 req/min), 1 replica,
@@ -114,10 +121,10 @@ def calibrate_interceptor_overhead(app_url, interceptor_url, rounds, log_dir):
     time.sleep(10)
     results = {'direct': [], 'interceptor': []}
     for i in range(rounds):
-        _, da, dp, _ = run_hey(app_url, 60.0)
+        _, da, _, dp, _, _, _ = run_hey(app_url, 60.0)
         results['direct'].append({'avg_ms': da * 1000, 'p90_ms': dp * 1000})
         logging.info(f"  round {i+1} direct     : avg={da*1000:.1f}ms p90={dp*1000:.1f}ms")
-        _, ia, ip, _ = run_hey(interceptor_url, 60.0, host_header=True)
+        _, ia, _, ip, _, _, _ = run_hey(interceptor_url, 60.0, host_header=True)
         results['interceptor'].append({'avg_ms': ia * 1000, 'p90_ms': ip * 1000})
         logging.info(f"  round {i+1} interceptor: avg={ia*1000:.1f}ms p90={ip*1000:.1f}ms")
     mean = lambda k, f: float(np.mean([r[f] for r in results[k]]))
@@ -233,7 +240,8 @@ if __name__ == "__main__":
             if 0 <= int(m) < MINUTES_PER_DAY:
                 matrix[i, int(m)] += 1
 
-    headers = ["Step", "Reward", "Latency_P90", "Latency_Avg", "Replicas",
+    headers = ["Step", "Reward", "Latency_P50", "Latency_P90", "Latency_P95",
+               "Latency_P99", "Latency_Avg", "Replicas",
                "CPU_Pct", "RAM_Pct", "Base_Requests", "Requests", "Total_CPU", "Total_RAM",
                "Success", "Throughput", "Target_RPM"]
     with open(out_csv, 'w', newline='') as f:
@@ -249,7 +257,7 @@ if __name__ == "__main__":
         min_idx = step % MINUTES_PER_DAY
         raw_req = float(matrix[day_idx, min_idx])
 
-        reqs, lat_avg, lat_p90, succ = run_hey(args.url, raw_req, host_header=True,
+        reqs, lat_avg, lat_p50, lat_p90, lat_p95, lat_p99, succ = run_hey(args.url, raw_req, host_header=True,
                                                load_multiplier=args.load_multiplier)
         cpu, ram, t_cpu, t_ram = get_resources_usage()
         reps = get_replicas()
@@ -269,7 +277,9 @@ if __name__ == "__main__":
         reward = 0.55 * r_sla + 0.25 * r_cpu + 0.08 * r_stab + 0.12 * r_succ
         last_replicas = reps
 
-        row = {"Step": step, "Reward": reward, "Latency_P90": lat_p90 * 1000,
+        row = {"Step": step, "Reward": reward,
+               "Latency_P50": lat_p50 * 1000, "Latency_P90": lat_p90 * 1000,
+               "Latency_P95": lat_p95 * 1000, "Latency_P99": lat_p99 * 1000,
                "Latency_Avg": lat_avg * 1000, "Replicas": reps,
                "CPU_Pct": cpu, "RAM_Pct": ram, "Base_Requests": raw_req, "Requests": reqs,
                "Total_CPU": t_cpu, "Total_RAM": t_ram, "Success": succ,
