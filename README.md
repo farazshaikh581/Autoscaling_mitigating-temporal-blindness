@@ -199,7 +199,11 @@ depending on method/log type, `Latency_P50`/`Latency_P95`/`Latency_P99`.
 
 ## Reproducibility
 
-All results in the paper use random seed 42 (`SEED = 42` in all scripts). 7 days are sampled from the trace (5 train, 2 test), with `MINUTES_PER_DAY = 500` steps per simulated day.
+Every run samples 7 days from the trace (5 train, 2 test), with `MINUTES_PER_DAY = 500` steps
+per simulated day. The original single-seed submission used `SEED = 42` throughout. The
+revised evaluation runs Double-LSTM and Single-LSTM across 5 seeds (123, 456, 789, 1337, 2024)
+on both clusters, each seed selecting a different 5-day/2-day split via `get_random_days()`;
+KEDA and Static HPA remain single-run baselines at seed 42, matching the original submission.
 
 ---
 
