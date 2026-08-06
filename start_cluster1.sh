@@ -5,6 +5,6 @@
 export CLUSTER_NAME="C1-4workers"
 
 cd "$(dirname "$0")"
-source /home/studente/rl_autoscaler_project/venv/bin/activate
+source ~/rl_autoscaler_project/venv/bin/activate
 
 ./run_all_experiments.sh "${1:?usage: start_cluster1.sh <service-url>}"
