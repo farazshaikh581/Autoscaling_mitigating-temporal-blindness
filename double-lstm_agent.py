@@ -61,15 +61,15 @@ application = "factorizator"
 app_env = "factorizator"
 cpu_target_percentage = 50
 MIN_REPLICAS = 1
-MAX_REPLICAS = 200
+MAX_REPLICAS = 100
 NR_REQUESTS_MAX = 3000
 FORECAST_WINDOW = 3
-MINUTES_PER_DAY = 500 
+MINUTES_PER_DAY = 500
 
-W_SLA  = 0.50
+# Rt = w_slo*R_SLO + w_cpu*R_CPU + w_succ*R_Succ + w_stab*R_Stab (no forecast term)
+W_SLA  = 0.55
 W_CPU  = 0.25
 W_STAB = 0.08
-W_FCST = 0.05
 W_SUCC = 0.12
 L_TARGET = 0.020
 L_THRESH = 0.050
@@ -418,19 +418,11 @@ class MultiAgentClusterEnv(gym.Env):
             r_succ = 1.0
         else:
             r_succ = float(np.log(max(succ, 1e-6)))
-    
 
-        effreq = float(self.state[4])
-        Nt = float(self.forecast_running_avg)
-        C = float(NOMINAL_CAP_PER_REPLICA)
-        err = (effreq - Nt) / max(C, 1e-6)
-        r_fcst = -(err ** 2)
-    
         reward = (
             W_SLA  * r_sla +
             W_CPU  * r_cpu +
             W_STAB * r_stab +
-            W_FCST * r_fcst +
             W_SUCC * r_succ
         )
     
@@ -510,8 +502,8 @@ class MultiAgentClusterEnv(gym.Env):
         # We start with 50% target. PPO will patch this later.
         time.sleep(2)
         subprocess.run([
-            'kubectl', 'autoscale', 'deploy', application, '-n', app_env, 
-            '--cpu-percent=50', '--min=1', '--max=200'
+            'kubectl', 'autoscale', 'deploy', application, '-n', app_env,
+            '--cpu-percent=50', '--min=1', f'--max={MAX_REPLICAS}'
         ], stdout=subprocess.DEVNULL)
         
         logging.info("✅ Cluster Reset: HPA Created (50%), Replicas=1")

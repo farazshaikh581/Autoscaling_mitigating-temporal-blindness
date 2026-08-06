@@ -199,9 +199,8 @@ class DQNClusterEnv(gym.Env):
         r_stab = -0.1 * delta if delta <= 2 else -0.5 * delta
         r_succ = 1.0 if succ >= 0.99 else float(np.log(max(succ, 1e-6)))
 
-        # Same weights as Double-LSTM (no forecast term — w_fcst redistributed)
-        reward = 0.50 * r_slo + 0.25 * r_cpu + 0.12 * r_succ + 0.08 * r_stab + \
-                 0.05 * r_slo  # substitute forecast weight with extra SLO signal
+        # Rt = w_slo*R_SLO + w_cpu*R_CPU + w_succ*R_Succ + w_stab*R_Stab (no forecast term)
+        reward = 0.55 * r_slo + 0.25 * r_cpu + 0.12 * r_succ + 0.08 * r_stab
         self.reward = float(reward)
         self.last_replicas = reps
         return self.reward

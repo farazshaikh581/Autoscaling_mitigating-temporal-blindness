@@ -56,9 +56,9 @@ application = "factorizator"
 app_env = "factorizator"
 cpu_target_percentage = 50
 MIN_REPLICAS = 1
-MAX_REPLICAS = 200
+MAX_REPLICAS = 100
 NR_REQUESTS_MAX = 3000
-MINUTES_PER_DAY = 500 
+MINUTES_PER_DAY = 500
 
 
 
@@ -280,11 +280,11 @@ class MultiAgentClusterEnv(gym.Env):
         else:
             r_succ = float(np.log(max(succ, 1e-6)))
     
-        # No-forecast: renormalize weights (drop 0.05 forecast)
-        W_SLA  = 0.50 / 0.95
-        W_CPU  = 0.25 / 0.95
-        W_STAB = 0.08 / 0.95
-        W_SUCC = 0.12 / 0.95
+        # Rt = w_slo*R_SLO + w_cpu*R_CPU + w_succ*R_Succ + w_stab*R_Stab (no forecast term)
+        W_SLA  = 0.55
+        W_CPU  = 0.25
+        W_STAB = 0.08
+        W_SUCC = 0.12
     
         reward = W_SLA * r_sla + W_CPU * r_cpu + W_STAB * r_stab + W_SUCC * r_succ
     
@@ -339,7 +339,7 @@ class MultiAgentClusterEnv(gym.Env):
         time.sleep(2)
     
         subprocess.run(["kubectl", "autoscale", "deploy", application, "-n", app_env,
-                        "--cpu-percent=50", "--min=1", "--max=200"],
+                        "--cpu-percent=50", "--min=1", f"--max={MAX_REPLICAS}"],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     
         time.sleep(5)

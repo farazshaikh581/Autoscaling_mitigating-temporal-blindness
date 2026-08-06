@@ -194,8 +194,8 @@ class StaticBenchmark:
         # 2. Reset HPA (Delete RL HPA, Create Static HPA)
         subprocess.run(['kubectl', 'delete', 'hpa', application, '-n', app_env], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(2)
-        # 3. Create Static HPA (Target 50%, Min 1, Max 30)
-        subprocess.run(['kubectl', 'autoscale', 'deploy', application, '-n', app_env, '--cpu-percent=50', '--min=1', '--max=200'], stdout=subprocess.DEVNULL)
+        # 3. Create Static HPA (Target 50%, Min 1, Max 100)
+        subprocess.run(['kubectl', 'autoscale', 'deploy', application, '-n', app_env, '--cpu-percent=50', '--min=1', '--max=100'], stdout=subprocess.DEVNULL)
         logging.info("✅ Static HPA (50%) Applied.")
         time.sleep(10)
 
