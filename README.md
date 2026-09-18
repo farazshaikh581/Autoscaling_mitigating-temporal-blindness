@@ -1,6 +1,6 @@
-# Mitigating Temporal Blindness in Kubernetes Autoscaling
+# Stability-Aware Supervisory Control for Kubernetes Autoscaling
 
-**Paper:** *Mitigating Temporal Blindness in Kubernetes Autoscaling: An Attention-Double-LSTM Framework*
+**Paper:** *Stability-Aware Supervisory Control for Kubernetes Autoscaling: A History-Informed Reinforcement Learning Framework*
 
 Code, configuration files, and result logs for the experiments in the paper. Four autoscaling approaches are implemented and compared on a real Kubernetes cluster using the Azure Functions Invocation Trace (2021).
 
@@ -14,6 +14,12 @@ Code, configuration files, and result logs for the experiments in the paper. Fou
 | `single-lstm_agent.py` | Baseline | Single LSTM + PPO (no attention) |
 | `keda_baseline.py` | Baseline | KEDA HTTP add-on, reactive request-rate autoscaling |
 | `static-hpa50.py` | Benchmark | Kubernetes HPA at 50% CPU target |
+
+`ddqn_agent.py` and `drqn_agent.py`, and the `ddqn`/`drqn` cases in `launch_experiment.sh` and
+the DDQN phase in `run_all_experiments.sh`/`visualize_results.py`, are **legacy**: Double DQN was
+evaluated in an earlier revision and dropped from the paper (it collapsed to a fixed 1-replica
+policy on the current testbed), superseded by the KEDA baseline above. They remain in the repo
+for reference but are not part of the current paper's evaluation.
 
 ---
 
@@ -192,6 +198,12 @@ python visualize_results.py
 
 CSV columns (RL agents): `Step, Reward, Latency_P90, Latency_Avg, Replicas, CPU_Pct, RAM_Pct, Requests, Total_CPU, Total_RAM, Success, HPA_Target, Throughput, Enhancement, Forecast`
 
+`Enhancement` and `Forecast` are logged fields from `double-lstm_agent.py`'s action/observation
+space (a 3rd action dimension and a 14th state feature). The paper describes a simplified
+2-action, 13-dim design; the shipped script and its logged columns still carry the earlier,
+unsimplified interface. `Reward` also reflects the current 4-term SLO/CPU/success/stability
+weighting (no separate forecast-reward term), matching the paper.
+
 The 5-seed, 2-cluster CSVs additionally carry a leading `Cluster` column (`C1`/`C2`) and,
 depending on method/log type, `Latency_P50`/`Latency_P95`/`Latency_P99`.
 
@@ -210,8 +222,8 @@ KEDA and Static HPA remain single-run baselines at seed 42, matching the origina
 ## Citation
 
 ```bibtex
-@article{shaikh2026temporal,
-  title   = {Mitigating Temporal Blindness in Kubernetes Autoscaling: An Attention-Double-LSTM Framework},
+@article{shaikh2026stability,
+  title   = {Stability-Aware Supervisory Control for Kubernetes Autoscaling: A History-Informed Reinforcement Learning Framework},
   author  = {Shaikh, Faraz and Reali, Gianluca and Femminella, Mauro},
   journal = {(under review / to appear)},
   year    = {2026}
