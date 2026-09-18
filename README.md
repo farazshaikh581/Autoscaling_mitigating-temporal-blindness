@@ -217,6 +217,33 @@ revised evaluation runs Double-LSTM and Single-LSTM across 5 seeds (123, 456, 78
 on both clusters, each seed selecting a different 5-day/2-day split via `get_random_days()`;
 KEDA and Static HPA remain single-run baselines at seed 42, matching the original submission.
 
+### Workload carried by each seed
+
+Because each seed samples a different window of the Azure trace, the six seeds used across the
+paper's experiments do not carry equal load. This table was originally Table I in the paper and
+is provided here instead, per the reference in the manuscript ("per-seed peak loads are provided
+alongside the released code").
+
+| Seed | Train load (req/min) | Test load (req/min) | Test peak (req/min) |
+|---|---|---|---|
+| 42 (baselines) | 70.8 | 187.3 | 2,587 |
+| 123 | 85.9 | 75.6 | 769 |
+| 456 | 88.5 | 195.8 | 963 |
+| 789 | 173.7 | 41.5 | 737 |
+| 1337 | 85.9 | 88.7 | 1,021 |
+| 2024 | 110.8 | 57.3 | 525 |
+
+Seed `42 (baselines)` is the seed used for Static HPA @ 50% and KEDA (the single-run baselines),
+while the other five seeds (123, 456, 789, 1337, 2024) are the additional seeds used to evaluate
+the learning-based agents (Single-LSTM, Double-LSTM) with confidence intervals. Seed 42's test
+peak (2,587 req/min) is the heaviest across all six seeds and is what the maximum replica count
+(`MAX_REPLICAS = 100`, see `double-lstm_agent.py`) was sized against.
+
+"Train load" and "Test load" are mean request rates over the respective 5-day/2-day split for
+that seed's sampled trace segment; "Test peak" is the maximum observed rate during the 2-day
+test window. See `get_random_days()` in each agent script for the seed-to-split sampling logic,
+and `analyze_traces.py` for trace-level rate computation.
+
 ---
 
 ## Citation
