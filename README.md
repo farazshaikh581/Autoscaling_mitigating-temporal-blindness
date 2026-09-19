@@ -1,6 +1,6 @@
-# Stability-Aware Supervisory Control for Kubernetes Autoscaling
+# Stability-Aware Reinforcement Learning for Container Autoscaling
 
-**Paper:** *Stability-Aware Supervisory Control for Kubernetes Autoscaling: A History-Informed Reinforcement Learning Framework*
+**Paper:** *Stability-Aware Reinforcement Learning for Container Autoscaling*
 
 Code, configuration files, and result logs for the experiments in the paper. Four autoscaling approaches are implemented and compared on a real Kubernetes cluster using the Azure Functions Invocation Trace (2021).
 
@@ -250,7 +250,7 @@ and `analyze_traces.py` for trace-level rate computation.
 
 ```bibtex
 @article{shaikh2026stability,
-  title   = {Stability-Aware Supervisory Control for Kubernetes Autoscaling: A History-Informed Reinforcement Learning Framework},
+  title   = {Stability-Aware Reinforcement Learning for Container Autoscaling},
   author  = {Shaikh, Faraz and Reali, Gianluca and Femminella, Mauro},
   journal = {(under review / to appear)},
   year    = {2026}
